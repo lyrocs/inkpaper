@@ -24,6 +24,10 @@ ui-features:
     cargo check -p inkpaper-ui --tests --examples --benches --no-default-features
     cargo check -p inkpaper-ui --tests --examples --benches --all-features
 
+# serves the Building InkPaper book at http://localhost:3000
+book:
+    mdbook serve book --open
+
 sim:
     cargo run -p {{simulator_package}}
 
