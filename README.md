@@ -156,6 +156,17 @@ The X4 PRO firmware targets the ESP32-S3, which requires the Xtensa toolchain. I
 
 The hardware development and flashing workflow is still evolving. Until it stabilizes, the repository configuration is the source of truth for the exact target, runner, and firmware build settings.
 
+## Learning from the code
+
+The [`book/`](book/src/SUMMARY.md) folder holds *Building InkPaper*, a step-by-step
+book that follows the project's history to teach Rust with concrete examples from
+this repository, in chapters of 15 to 20 minutes. Read it on GitHub, or build it with
+[`mdbook`](https://github.com/rust-lang/mdBook):
+
+```bash
+mdbook serve book --open
+```
+
 ## Contributing
 
 InkPaper is still early and its internal design is changing quickly.
