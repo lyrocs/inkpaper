@@ -1,129 +1,73 @@
-# Appendix A: Rust concept index
+# Appendix A: Find a Rust idea by its job
 
-Use this table to find where a Rust feature is explained with an example from
-InkPaper. Chapter numbers point to the main explanation, and later chapters
-often revisit the idea.
+A language feature is easier to remember when you remember what it made possible.
+Use this index to return to the chapter where a Rust idea solves a concrete
+problem. These are entry points, not a list of every syntax form that appears in
+the source.
 
-## Language basics
+## Describe a screen and own its state
 
-| Concept | Chapters |
-|---------|----------|
-| Newtypes (`struct Pixels(i32)`) | 2, 7, 11, 15 |
-| Enums with data; closed sets of variants | 2, 6, 9, 12 |
-| `match`: tuples, guards, or-patterns, struct patterns with literals | 4, 5, 6, 11, 17 |
-| Slice patterns (`[]`, `[x]`, `[_, y, ..]`, `let &[a, b] = ... else`) | 18, 19 |
-| `let ... else` | 5, 7, 9, 12 |
-| `if let` / `while let`, let chains | 1, 6, 10 |
-| `if` and `match` as expressions | 9, 13 |
-| The never type `!`, `return` in match arms | 10, 13 |
-| `const fn`, `const` items, inline `const { }` blocks | 2, 9, 10, 17 |
-| Integer overflow: checked, saturating, wrapping | 4, 7, 15, 16 |
-| Lossless `From` vs fallible `TryFrom`; `as` casts and their lints | 1, 7, 16 |
-| Operator overloading (`Add`, `Sub`, `Mul<Rhs>`) | 7 |
-| Strings: UTF-8 bytes, `char`, byte slicing, `str::get` | 6, 15, 17, 18 |
+| Rust idea | The question it answers | Read |
+|---|---|---|
+| Cargo workspaces and features | How can a desktop app and firmware share code without sharing every dependency? | [1](ch01-workspace.md) |
+| `core`, `alloc`, and `std` | Which services does this part of the program actually need? | [1](ch01-workspace.md) |
+| Builders that consume `self` | How can a chain of calls construct a screen description? | [2](ch02-ui-language.md) |
+| Traits and `impl Trait` | How can different element types participate in one UI? | [2](ch02-ui-language.md) |
+| Generics and associated types | How can the type of a container express the children it holds? | [2](ch02-ui-language.md) |
+| Typed handles and `PhantomData` | How can a temporary view refer to state that outlives it? | [3](ch03-entities.md) |
+| Borrowing through a context | Who is allowed to read or update application state right now? | [3](ch03-entities.md) |
+| `Result` versus panicking accessors | Is a failed state lookup recoverable or a broken program assumption? | [3](ch03-entities.md) |
+| Type erasure and `unsafe` invariants | How can one store hold differently typed values without losing its safety contract? | [4](ch04-slot-table.md) |
+| Alignment, initialization, and destruction | What must be true before bytes can be treated as a Rust value? | [4](ch04-slot-table.md) |
+| Storage strategy types | How can each runtime choose bounded or heap-backed storage? | [4](ch04-slot-table.md) |
+| Closures, `Fn`, and `'static` | How can a button keep behavior to call after rendering has finished? | [5](ch05-listeners.md) |
 
-## Ownership, borrowing and lifetimes
+## Turn intent into pixels and interaction
 
-| Concept | Chapters |
-|---------|----------|
-| `self` by value for builders and one-shot types | 2, 14 |
-| Lifetimes in structs (`Text<'a>`, `Context<'a, T>`) | 2, 3 |
-| Outputs that borrow inputs (`Pagination<'a>`) | 18 |
-| Several lifetimes on one struct | 18 |
-| Borrowed results that block mutation (`GlyphBitmap<'_>`) | 16 |
-| `'static` bounds and why stored closures need them | 3, 5 |
-| `Cow` and `into_owned` | 18 |
-| Ownership of hardware (peripherals, buses, pins) | 11, 13 |
-| Never holding a borrow across `.await` | 14 |
-| Drop guards; `let _ = x` vs `let _guard = x` | 3, 4, 10, 20 |
+| Rust idea | The question it answers | Read |
+|---|---|---|
+| Enums versus traits | When should the set of possibilities be closed, and when should it be extensible? | [6](ch06-frame-tree.md), [8](ch08-painting.md) |
+| Index-based trees | How can a retained frame represent relationships without owning pointers between nodes? | [6](ch06-frame-tree.md) |
+| Newtypes and integer arithmetic | How can layout calculations preserve units and handle pixel boundaries? | [7](ch07-layout.md) |
+| Explicit enum variants | How is “unbounded space” different from a very large number? | [7](ch07-layout.md) |
+| Associated error types and trait objects | How can one painting interface work with different backends? | [8](ch08-painting.md) |
+| Bounded collections | What should happen when there are too many damaged rectangles to track? | [9](ch09-damage.md) |
+| Typed events and marker traits | How can a component report intent without knowing its owner's implementation? | [10](ch10-events.md) |
+| State machines | How do a press, a release, and a cancellation become different behaviors? | [10](ch10-events.md) |
 
-## Traits and generics
+## Work with devices without blocking the reader
 
-| Concept | Chapters |
-|---------|----------|
-| Default methods, supertraits | 2, 16 |
-| Associated types; bounds and equality constraints on them | 2, 8, 14 |
-| Generic associated types (`type WithChild<E>`) | 2, 4 |
-| Blanket implementations | 2 |
-| Marker traits (`Global`, `EventEmitter<E>`) | 3, 10 |
-| `impl Trait` in argument and return position | 2, 3 |
-| Trait objects (`dyn`) vs generics | 6, 8, 13 |
-| Implementing a trait for `()` | 8 |
-| Strategy types for configuration (`RuntimeStorage`) | 4 |
-| Const generics, with defaults | 4, 9, 16 |
-| `PhantomData` and variance | 3, 5 |
-| Manual `Copy`/`Clone` impls to avoid derive bounds | 3 |
-| Derived ordering (enums by declaration order, structs lexicographically) | 9, 15, 18 |
-| `async fn` in traits | 12, 14, 15 |
+| Rust idea | The question it answers | Read |
+|---|---|---|
+| Generic drivers and `embedded-hal` | How can a chip driver work with more than one microcontroller? | [11](ch11-i2c-driver.md) |
+| Error enums and validated values | How do bus failures and invalid measurements stay distinguishable? | [11](ch11-i2c-driver.md) |
+| Async traits and timeouts | How can software wait for a display without waiting forever? | [12](ch12-epaper.md) |
+| Enum dispatch | How can firmware select among known display controllers at runtime? | [12](ch12-epaper.md) |
+| Ownership of peripherals | How does Rust help control access to real hardware? | [13](ch13-firmware.md) |
+| Futures, tasks, channels, and signals | How can several activities make progress while most are waiting? | [13](ch13-firmware.md) |
+| Requests as data | How can a synchronous UI ask for asynchronous work? | [14](ch14-services.md) |
+| Scoped borrowing around `.await` | How can a service release UI access while I/O is pending? | [14](ch14-services.md) |
 
-## Closures and iterators
+## Make document bytes readable
 
-| Concept | Chapters |
-|---------|----------|
-| `Fn`, `FnMut`, `FnOnce` | 3, 5 |
-| Methods and enum variants as functions | 5, 11, 14 |
-| Higher-ranked bounds (`for<'a>`) | 5 |
-| Visitor closures instead of collections | 16, 17 |
-| `Option` combinators (`map`, `and_then`, `or_else`, `filter`, `is_some_and`, `is_none_or`, `then_some`) | 5, 7, 10, 14, 15 |
-| Iterator adapters (`rev`, `fold`, `scan`, `flatten`, `copied`, `filter`) | 9, 13, 15, 18 |
-| `partition_point`, `rotate_left`, slice comparison | 12, 14, 18 |
+| Rust idea | The question it answers | Read |
+|---|---|---|
+| Minimal I/O traits | How can an EPUB parser read from either a desktop file or embedded storage? | [15](ch15-epub.md) |
+| Checked arithmetic and validated paths | How should a parser handle data it cannot trust? | [15](ch15-epub.md) |
+| Borrowed resource views | Why can't a glyph cache be changed freely while its pixels are borrowed? | [16](ch16-fonts.md) |
+| UTF-8 and source ranges | Why are bytes, characters, glyphs, and screen positions different coordinates? | [17](ch17-shaping.md) |
+| Lifetimes at a pipeline boundary | Which pagination data is borrowed, and what can the reader retain? | [18](ch18-reader.md) |
+| Semantic position types | How can a reading position survive a change in page layout? | [18](ch18-reader.md) |
 
-## Unsafe and low-level
+## Make development clearer and measurable
 
-| Concept | Chapters |
-|---------|----------|
-| `unsafe`, `# Safety` docs, `// SAFETY:` comments, module invariants | 4 |
-| Raw pointers, `NonNull`, `addr_of_mut!`, `drop_in_place` | 4 |
-| Type erasure with `TypeId`, `Layout` and function pointers | 4, 5 |
-| `MaybeUninit`, `UnsafeCell`, `Cell`, `RefCell` | 4 |
-| `#[repr(C)]`, `#[repr(u8)]`, alignment, zero-sized types | 4, 11 |
-| Panic safety | 4 |
+| Rust idea | The question it answers | Read |
+|---|---|---|
+| Declarative and procedural macros | When does generated Rust make UI code easier to understand? | [19](ch19-macros.md) |
+| Parsing tokens and producing diagnostics | How can a custom notation fail helpfully rather than mysteriously? | [19](ch19-macros.md) |
+| `Drop` guards | How can a timed span end on an early return as well as the normal path? | [20](ch20-measuring.md) |
+| Conditional compilation and instrumentation | How can measurement be available when needed without assuming it is free? | [20](ch20-measuring.md) |
 
-## Embedded and async
-
-| Concept | Chapters |
-|---------|----------|
-| `no_std`, `core` vs `alloc` vs `std`, `#![no_main]` | 1, 13 |
-| `embedded-hal` traits, generic drivers | 11, 12 |
-| `async`/`await`, futures, executors | 11, 13 |
-| `select`, timeouts, cancellation by drop | 12, 13 |
-| Pinning (`Pin`, `pin!`) | 13 |
-| Tasks, `Channel`, `Signal`, shared buses, `StaticCell` | 13 |
-| Request/reply over channels with `Arc` | 14 |
-| Critical sections, atomics, `target_has_atomic` | 13, 20 |
-| Floats in `no_std` with `libm` | 16 |
-| `defmt` logging | 13 |
-
-## Errors
-
-| Concept | Chapters |
-|---------|----------|
-| Error enums and `From` for `?` | 6, 15 |
-| Generic error wrappers (`Error<E>`, `PaintError<E>`) | 8, 11, 12, 15 |
-| `panic!` vs `Result`, `try_` variants, `#[track_caller]` | 3 |
-| `expect` with a reason | 15 |
-| Reporting the root cause when cleanup also fails | 12 |
-| `Result<Option<T>, E>` | 14 |
-
-## Macros
-
-| Concept | Chapters |
-|---------|----------|
-| `macro_rules!`: fragments, repetitions, `$crate`, `stringify!` | 2, 19, 20 |
-| The macro callback pattern | 19 |
-| Procedural macros with `syn`, `quote`, `proc-macro2` | 19, 20 |
-| Spanned errors, hygiene (`Span::mixed_site`) | 19, 20 |
-| Compile-fail tests with `trybuild` | 19 |
-| Derive macros from crates (`bitfield`, `minicbor`, `clap`) | 11, 14, 20 |
-
-## Tooling and project structure
-
-| Concept | Chapters |
-|---------|----------|
-| Workspaces, `default-members`, workspace dependencies, profiles | 1 |
-| Features, optional dependencies, additivity | 1, 8, 16, 20 |
-| Conditional compilation (`cfg`, `cfg_attr`) | 1, 2, 16 |
-| Lints, `#[expect]` vs `#[allow]` | 1, 8, 16 |
-| Toolchains, targets, `build-std`, runners | 1 |
-| The xtask pattern, `justfile` | 1, 15, 20 |
-| Benchmarks and metrics before optimising | 7, 9, 20 |
+If a chapter feels difficult, follow its product question first. You can often
+understand why a boundary exists before understanding every generic parameter in
+its implementation. Return to the signature after the behavior makes sense.

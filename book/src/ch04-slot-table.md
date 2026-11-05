@@ -1,71 +1,16 @@
-# 4. An allocator-free arena
+# 4. Making memory predictable: the slot table
 
-> **Where we are:** commit `496fe14`, "no alloc entity arena", 8 August 2026,
-> where a 534-line `arena.rs` appeared. We then jump to its descendants:
-> `2b01497`–`a5f4fda` (9 September, optional heap storage) and the refactor of 4
-> October (`f48dc17`–`a9f8678`), which merged three arenas into one **slot table**
-> and let applications choose storage with a type.
+A reader should not run out of UI memory simply because someone opens the same menu many times. Nor should adding a battery indicator silently invalidate a pointer to the book state. These expectations sound ordinary until the runtime must store values of different types, allow nested access, and optionally work without a general-purpose heap.
 
-## The requirements
+Chapter 3 gave application code a small typed handle. This chapter looks behind it. The objective is not to learn every raw-pointer operation in the repository. It is to understand the handful of promises that let a safe handle API sit on top of heterogeneous storage—and why those promises matter to the person holding the reader.
 
-Chapter 3 said the runtime owns every entity's state. Now we have to build the
-place where it lives. Here is what it must do:
+## Two budgets, not one
 
-1. Store values of **many different types**: an `InkPaperApp`, a `BatteryState`,
-   a `ReaderDrawer`... all in one container.
-2. Work **without a heap**, in a buffer whose size is fixed at compile time.
-3. Never **move** a value once stored, because code may hold a pointer to it while
-   it runs.
-4. Check at runtime that nobody reads an entity while someone else is mutating
-   it, the job `RefCell` normally does.
-5. **Drop** every value exactly once, with its correct destructor.
+A table of entity state has to accommodate both *how many values* exist and *how much space they occupy*. Thirty tiny values can exhaust a slot limit; one large value can exhaust the byte buffer. Increasing one limit does not fix the other. Alignment adds padding, and metadata consumes memory outside the value buffer, so a byte capacity is not the size of the entire runtime.
 
-Safe Rust can't express this directly. A `Vec<T>` holds one type, and a
-`Vec<Box<dyn Any>>` allocates. So this is the chapter where InkPaper reaches for
-`unsafe`. The interesting part is how carefully it does so.
+The common mechanism is `SlotTable<S, M>` in `crates/ui/src/slot_table.rs`. `S` selects the storage; `M` is metadata chosen by the entity, callback, or global arena. This is its exact slot definition:
 
-## What `unsafe` actually means
-
-`unsafe` does not turn off the borrow checker. It unlocks five extra
-abilities, and the main one here is **dereferencing raw pointers**
-(`*const T` / `*mut T`). The compiler can't verify those operations, so you
-promise that they are correct. The Rust convention is to write the promises
-down:
-
-- Every `unsafe fn` gets a `# Safety` section saying what the caller must
-  guarantee.
-- Every `unsafe { ... }` block gets a `// SAFETY:` comment saying why the
-  guarantee holds here.
-
-InkPaper goes one step further. The module that contains the unsafe code begins
-with its **invariants**, rules the whole module keeps:
-
-```rust
-//! SAFETY INVARIANTS:
-//!
-//! 1. a place is never reused while its slot exists, so values never move and never
-//!    overlap. Growing the slot list moves slots, not values.
-//! 2. only `Live` slots hold an initialized value. Each is dropped exactly once: when it
-//!    is removed, or when the table is cleared or dropped, in reverse reservation order.
-//! 3. no `RefCell` guard on the slot list is held while user code runs, so callbacks may
-//!    reserve new slots.
-//! 4. no reference to a fixed byte buffer as a whole is created while references to
-//!    stored values may exist.
-//! 5. borrow states only count borrows. Arenas pair each `acquire` with one `release`
-//!    and convert pointers into references only while the matching borrow is held.
-```
-
-If you remember one thing from this chapter, let it be this habit. Unsafe code is
-correct only relative to rules like these. Writing them down lets a reviewer
-check each `unsafe` block against a short list instead of against the whole
-program.
-
-## Type erasure: one table, many types
-
-The table is `SlotTable<S, M>` in `crates/ui/src/slot_table.rs`. Each entry is a
-`Slot`:
-
-```rust
+```rust,ignore
 struct Slot<P, M> {
     place: P,
     meta: M,
@@ -75,49 +20,17 @@ struct Slot<P, M> {
 }
 ```
 
-There is no `T` anywhere. The table stores *bytes*, and each slot remembers
-three things about the value in them:
+The missing type parameter is the interesting one: there is no stored-value type `T`. A single table can therefore hold a battery state, a drawer state, and an application root. The slot remembers where the value lives and how to destroy it, rather than embedding every possible application type in one giant enum.
 
-- **`place`**: where the bytes are.
-- **`meta`**: arena-specific metadata. For entities it holds the value's
-  `TypeId`, so every access can check the type.
-- **`drop_fn`**: a **function pointer** to the value's destructor.
+When the entity arena reserves a value, it supplies `Layout::new::<T>()`, `TypeId::of::<T>()`, and `drop_value::<T>`. The layout describes size and alignment; the type ID supports checking on access; the specialized function knows the correct destructor. The compiler generates that function for the concrete `T`, but the table stores it as an erased function pointer.
 
-The destructor comes from a tiny generic function:
+This is *type erasure*: retain the operations needed to manage a value while hiding its concrete type from the container. A `Box<dyn Any>` would provide a familiar heap-backed alternative. An application-specific enum could keep everything in safe Rust at the cost of knowing every variant and sizing each entry for the largest one. InkPaper's reusable runtime chooses a lower-level representation so it can accept arbitrary state types in fixed or heap storage.
 
-```rust
-pub(crate) unsafe fn drop_value<T>(ptr: *mut u8) {
-    unsafe { core::ptr::drop_in_place(ptr.cast::<T>()) };
-}
-```
+## A place must fit before it becomes a value
 
-When you write `drop_value::<BatteryState>`, the compiler generates a version of
-this function specialised for `BatteryState`, a process called
-**monomorphisation**. The result coerces to a plain `unsafe fn(*mut u8)` that has
-forgotten the type but still knows how to drop it. This is **type erasure by hand**:
-we keep a *function* that knows the type, while the data itself is untyped bytes.
-`Box<dyn Trait>` does the same thing behind the scenes with a vtable.
+The fixed implementation stores bytes inline. These exact declarations from `slot_table.rs` establish the buffer:
 
-Recall `create_entity` from chapter 3:
-
-```rust
-let reservation = store.reserve(Layout::new::<T>(), TypeId::of::<T>(), drop_value::<T>)?;
-```
-
-- `Layout::new::<T>()` gives the size and alignment of `T`.
-- `TypeId::of::<T>()` gives a unique id for the type. It needs `T: 'static`,
-  which is one reason `Render` requires `'static`.
-- `drop_value::<T>` gives the destructor.
-
-Those three values are all the table needs to manage a `T` without knowing what
-a `T` is.
-
-## Where the bytes live: a bump allocator
-
-Where values live is a pluggable strategy, chosen by the `ValueMemory` trait. The
-allocator-free version is a **bump allocator** over an inline buffer:
-
-```rust
+```rust,ignore
 #[repr(C, align(16))]
 struct Bytes<const N: usize> {
     bytes: [core::mem::MaybeUninit<u8>; N],
@@ -130,32 +43,13 @@ pub struct FixedMemory<const BYTES: usize> {
 }
 ```
 
-Several Rust features meet here.
+`const BYTES: usize` is a const generic: capacity participates in the type and determines the array's size. Inline does not necessarily mean stack-resident; it means the storage is part of its owning value, wherever that owner lives. `MaybeUninit` permits storage that has not yet been initialized. It avoids pretending that merely reserving space has constructed a valid application object.
 
-**Const generics.** `const BYTES: usize` is a *value* used as a type parameter.
-`FixedMemory<4096>` and `FixedMemory<8192>` are different types with different
-sizes, and the array length `N` comes straight from the parameter. No heap is
-needed, because the size is known at compile time.
+`UnsafeCell` permits interior mutation through a shared reference. It does not make arbitrary mutation safe; it gives the implementation the primitive needed to enforce its own rules. The cursor uses the safer `Cell<usize>`, which allows replacing a small value without lending a reference to its contents.
 
-**`MaybeUninit<u8>`.** A plain `[u8; N]` would have to be initialised and
-would promise every byte is a valid `u8`. `MaybeUninit` means "memory that may
-not hold a valid value yet", which is exactly what reserved-but-unwritten space
-is.
+The allocation strategy is a bump cursor. Align the next offset, reserve enough bytes, and advance. This exact method is the heart of `FixedMemory`:
 
-**`#[repr(C, align(16))]`.** By default Rust may lay out a struct however it
-likes. `repr(C)` fixes the layout, and `align(16)` puts the buffer on a 16-byte
-boundary. Each placement then only has to align its *offset*.
-
-**`UnsafeCell` and `Cell`.** We need to write into the buffer through a shared
-reference (`&self`), because many entities live in one table and the table is
-shared. Mutating through `&` is normally forbidden. `UnsafeCell` is the *only*
-legal way to opt out, and every interior-mutability type (`Cell`, `RefCell`,
-`Mutex`) is built on it. `Cell<usize>` is the safe version for small `Copy`
-values: you `get()` and `set()`, but you never get a reference inside.
-
-Placing a value just moves the cursor forward:
-
-```rust
+```rust,ignore
 fn place(&self, layout: Layout) -> Result<FixedPlace, ReserveError> {
     let alignment = layout.align();
     if alignment > FIXED_ALIGNMENT {
@@ -176,79 +70,23 @@ fn place(&self, layout: Layout) -> Result<FixedPlace, ReserveError> {
 
     Ok(FixedPlace { offset, size })
 }
-
-fn align_up(value: usize, alignment: usize) -> Option<usize> {
-    debug_assert!(alignment.is_power_of_two());
-
-    let mask = alignment - 1;
-    value.checked_add(mask).map(|v| v & !mask)
-}
 ```
 
-All the arithmetic is **checked**: `checked_add` returns `None` on overflow
-instead of wrapping, and `ok_or` turns that `None` into an error. When the buffer
-is full you get `Err(StorageFull)`, never a corrupted neighbour.
+The fixed buffer supports alignment up to 16. A more strongly aligned type is rejected rather than placed incorrectly. Checked arithmetic turns overflow into failure; exceeding the byte budget does the same. Even a zero-sized value consumes a one-byte place so reservations have distinct addresses.
 
-`size.max(1)` is a subtle detail. **Zero-sized types** (like the unit structs from
-chapter 2) occupy no bytes, so two of them could share an address. Bumping by at
-least one byte gives each value its own address, and the table's bookkeeping
-relies on that.
+This is intentionally not a full allocator. Removing a fixed-memory value does not move the cursor backward. A removed place can be reused when a later value fits its size and alignment; otherwise reserving new space can leave unusable holes. A complete reset reclaims the buffer. Heap storage instead gives each value its own allocation and can release that allocation when the value is removed. The metadata vector may grow without moving those separately allocated values.
 
-Getting a pointer to a place has to respect invariant 4:
+For fixed storage, the safety promise is that live values do not move relative to their buffer and remain at valid addresses during outstanding borrows. It is not a claim that the outer runtime is magically pinned for its entire life. Rust's surrounding borrows prevent moving it while references into it are in use.
 
-```rust
-fn base(&self) -> *mut u8 {
-    let storage = self.storage.get();
+## The unsafe part is a collection of obligations
 
-    // SAFETY: creates a raw pointer to the buffer without referencing it as a whole
-    unsafe { core::ptr::addr_of_mut!((*storage).bytes).cast::<u8>() }
-}
-```
+An `unsafe` block does not switch off Rust's type system. It permits operations whose prerequisites the compiler cannot prove, such as turning a raw pointer into a reference. Before doing that here, the implementation must know that memory is aligned, initialized, still alive, of the expected type, and borrowed compatibly.
 
-Why not just write `&mut (*storage).bytes`? Because that would create a
-`&mut` to the *whole buffer* while other code might hold `&T` references to
-values inside it. Two such references overlapping is undefined behaviour, even if
-nobody writes through them. `addr_of_mut!` makes a raw pointer *without* creating
-an intermediate reference. This is the kind of detail that Miri, Rust's
-undefined-behaviour detector, is built to catch.
+The lifecycle records make the initialization promise concrete. Reservation creates an `Initializing` slot. Only after a valid value is written does the internal `commit` operation mark it `Live`. An abandoned construction never becomes readable and must not have a destructor run as though it contained a finished value.
 
-### The heap version
+Access adds another check. The entity arena validates the handle, looks up a live slot, checks its `TypeId`, and acquires the required borrow. The exact acquisition logic in `slot_table.rs` expresses the familiar rule:
 
-With the `alloc` feature there is a second implementation, `HeapMemory`, which
-gives each value its own allocation:
-
-```rust
-#[cfg(feature = "alloc")]
-pub struct HeapPlace(Option<(NonNull<u8>, Layout)>);
-
-#[cfg(feature = "alloc")]
-impl Drop for HeapPlace {
-    fn drop(&mut self) {
-        if let Some((ptr, layout)) = self.0.take() {
-            // SAFETY: this place owns the allocation and its original layout
-            unsafe { alloc::alloc::dealloc(ptr.as_ptr(), layout) };
-        }
-    }
-}
-```
-
-`NonNull<u8>` is a raw pointer that is guaranteed not to be null, so
-`Option<NonNull<u8>>` has the same size as a bare pointer (the *niche
-optimisation*). `Option::take()` swaps the value out and leaves `None`, so even a
-second `drop` couldn't free twice.
-
-## A hand-written `RefCell`
-
-Invariant 5 says borrow states only *count* borrows. Here is the counter:
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BorrowState {
-    Free,
-    Shared(u16),
-    Exclusive,
-}
-
+```rust,ignore
 impl BorrowState {
     fn acquire(self, kind: BorrowKind) -> Option<Self> {
         match (kind, self) {
@@ -263,234 +101,41 @@ impl BorrowState {
 }
 ```
 
-That is Rust's borrowing rule ("many readers *or* one writer") written as a
-`match` on a tuple. Matching on `(kind, self)` lets each line state one whole
-case, and the `_ => None` arm catches every conflict. The `if count < u16::MAX`
-**match guard** stops the counter from overflowing.
+This is an excerpt of the implementation with its separate `release` method omitted. Several readers can coexist; a writer requires a free slot. The guard on the shared count prevents overflow. Failure becomes a borrow conflict, not a second conflicting reference.
 
-The entity arena puts it all together when someone asks for a borrow:
+`RawEntityBorrow` pairs a successful acquisition with release in its `Drop` implementation. The safe `read` and `update` APIs keep that guard alive while the user closure runs. Only within that interval do they create typed references from the validated pointer. The closure boundary from chapter 3 is thus part of the safety argument, not merely an API preference.
 
-```rust
-fn borrow(
-    &self,
-    entity: EntityId,
-    type_id: TypeId,
-    kind: BorrowKind,
-) -> Result<NonNull<u8>, EntityAccessError> {
-    if entity.generation() != 0 {
-        return Err(EntityAccessError::InvalidEntity);
-    }
+Two less visible rules deserve equal attention. The slot-list `RefCell` borrow is released before user code runs, so a handler can create another entity without re-borrowing the whole list illegally. And the fixed implementation obtains raw pointers without first creating a mutable reference to the entire byte buffer. Such a whole-buffer reference would overlap references to live values inside it, violating the very exclusivity being enforced per slot.
 
-    let slot = usize::from(entity.slot());
-    let (meta, ptr) = self.slots.live(slot).map_err(|error| match error {
-        NotLive::Initializing => EntityAccessError::NotReady,
-        NotLive::Missing | NotLive::Abandoned | NotLive::Removed => {
-            EntityAccessError::InvalidEntity
-        }
-    })?;
+Destruction has its own ordering. Removal marks a slot removed *before* invoking its destructor, preventing a destructor that unwinds from leaving the slot apparently live and eligible for a second destruction. The table traverses slots in reverse order when removing or clearing them. With callback slot reuse, that table order should not be confused with a fresh chronological ordering of every value ever placed there.
 
-    if meta.type_id != type_id {
-        return Err(EntityAccessError::TypeMismatch);
-    }
+These obligations work together. A type check alone cannot prove a pointer is live. A live slot alone cannot prove exclusive access. Reviewing unsafe code means following the whole chain, not being reassured by the presence of a `SAFETY` comment.
 
-    self.slots
-        .acquire(slot, kind)
-        .map_err(|_| EntityAccessError::BorrowConflict)?;
+## Choose the budget at the runtime boundary
 
-    Ok(ptr)
+Applications select storage through `RuntimeStorage`. This complete pedagogical declaration uses the public API and the same configuration pattern documented in `crates/ui/src/storage.rs`:
+
+```rust,noplayground
+use inkpaper_ui::*;
+
+struct DeviceStorage;
+
+impl RuntimeStorage for DeviceStorage {
+    type Entities = FixedEntityArena<4_096, 8>;
+    type Callbacks = FixedCallbackArena<2_048, 16>;
+    type Globals = FixedGlobalArena<256, 4>;
+    type Frame = FixedFrame<96, 2_048>;
+    type ElementStates = FixedElementStates<32>;
+    type Events = FixedEvents<8>;
 }
 ```
 
-It checks, in order, that the handle is valid, that the slot holds a live value,
-that the type matches, and that the borrow doesn't conflict. Only after all four
-does it hand out a pointer. A **guard** pairs every successful `acquire` with a
-`release`:
+It declares a storage policy, not a complete reader application; these capacities are not a promise that `InkPaperApp` fits. Associated types let each runtime table have an appropriate representation. With `alloc` enabled, heap-backed choices become available and may be mixed with fixed ones. The feature supplies a capability; the type selects how a particular runtime uses it.
 
-```rust
-impl Drop for RawEntityBorrow<'_> {
-    fn drop(&mut self) {
-        self.store.release(self.entity, self.kind);
-    }
-}
-```
+Fixed tables make exhaustion explicit and predictable. They do not bound allocations performed *inside* stored values: an entity containing a growing `Vec` still uses the heap. Heap tables relieve manual capacity planning but bring allocator failure and allocation overhead, and slot identifiers still have representational limits. Neither option is infinite memory. The useful question is which resources the application needs to bound and where failure can be handled sensibly.
 
-Now the `unsafe` in `Entity::try_read` from chapter 3 makes sense:
+## Try it: spend a tiny memory budget
 
-```rust
-let borrow = RawEntityBorrow::acquire(
-    cx.runtime.entities,
-    self.id,
-    TypeId::of::<T>(),
-    BorrowKind::Shared,
-)?;
+Optional, read-only: simulate fresh reservations in `FixedEntityArena<64, 4>`, using the `reserve` and `place` methods. Four `u64` values use 32 payload bytes with their usual eight-byte alignment; a fifth reservation fails on slots before consuming more payload space. Now start fresh with `[u8; 40]`: the first fits, but the second exceeds 64 bytes, despite an available slot.
 
-let value = unsafe { &*borrow.ptr().cast::<T>().as_ptr() };
-
-Ok(f(value))
-```
-
-The cast to `*const T` is justified because the type was checked. The `&*`
-creates a shared reference, which is justified because a shared borrow is
-registered. And `borrow` lives until the end of the function, *after* `f`
-returns, so the reference never outlives the registration. The closure-based API
-from chapter 3 is what makes this provable: the reference can't escape `f`.
-
-Invariant 3 matters here too. The table keeps its slot list in a `RefCell`, but
-it never holds that `RefCell` borrowed while user code runs. Otherwise an entity
-that creates another entity during `update` would hit "already borrowed" and
-panic.
-
-## Dropping exactly once
-
-Removal is careful about the order of operations:
-
-```rust
-for slot in slots.iter_mut().rev() {
-    if slot.state != SlotState::Live || !predicate(&slot.meta) {
-        continue;
-    }
-
-    // mark first, so an unwinding destructor can't lead to a second drop
-    slot.state = SlotState::Removed;
-    removed += 1;
-
-    // SAFETY: live slots hold an initialized value matching `drop_fn`
-    unsafe { (slot.drop_fn)(self.memory.ptr(&slot.place).as_ptr()) };
-    self.memory.free(&mut slot.place);
-}
-```
-
-A user's destructor might panic. If the state were updated *after* calling it,
-an unwinding panic would leave the slot marked `Live`, and the table's own `Drop`
-would run the destructor a second time: a double free. Marking first closes that
-hole. `.rev()` drops values in reverse creation order, like local variables in a
-function, so a value created later (which may refer to an earlier one) goes first.
-
-## Choosing storage with a type
-
-For its first month, the arena was purely fixed-size. In September a heap version
-appeared behind the `alloc` feature, because the simulator had no reason to count
-bytes. In October the two were unified. Today one `SlotTable` serves entities,
-callbacks and globals, and **where its memory comes from is a type parameter**:
-
-```rust
-/// where a slot table keeps its values and slots
-pub trait SlotStorage {
-    type Memory: ValueMemory;
-    type Slots<T>: VecStorage<T>;
-}
-
-/// at most `SLOTS` values in an inline buffer of `BYTES` bytes. Never allocates.
-pub struct FixedSlots<const BYTES: usize, const SLOTS: usize>;
-
-impl<const BYTES: usize, const SLOTS: usize> SlotStorage for FixedSlots<BYTES, SLOTS> {
-    type Memory = FixedMemory<BYTES>;
-    type Slots<T> = heapless::Vec<T, SLOTS>;
-}
-```
-
-`FixedSlots` is a struct with no fields. It exists only to *name a choice*. Types
-used this way are often called **type-level configuration** or "strategy
-types". `type Slots<T>` is a generic associated type again: "a vector of any `T`".
-For fixed storage it's a `heapless::Vec`, a vector with inline, compile-time
-capacity. For heap storage it's a thin wrapper around `alloc::vec::Vec`. Both
-implement the crate's own `VecStorage<T>` trait:
-
-```rust
-pub trait VecStorage<T>: Default + Deref<Target = [T]> + DerefMut {
-    fn capacity(&self) -> usize;
-    fn try_reserve(&mut self, additional: usize) -> Result<(), StorageError>;
-    fn try_push(&mut self, value: T) -> Result<(), StorageError>;
-    // ...
-}
-```
-
-The supertrait `Deref<Target = [T]>` means "this derefs to a slice". Every slice
-method (`iter`, `len`, indexing, `binary_search`...) then works on both kinds of
-vector for free. The trait only adds what slices lack: fallible growth.
-
-At the top sits `RuntimeStorage`, a trait whose associated types pick one storage
-per table:
-
-```rust
-pub trait RuntimeStorage {
-    type Entities: EntityStorage;
-    type Callbacks: CallbackStorage;
-    type Globals: GlobalStorage;
-    type Frame: FrameStorage;
-    type ElementStates: ElementStateStorage;
-    type Events: EventStorage;
-}
-```
-
-The simulator chooses heap tables with initial reservations:
-
-```rust
-impl RuntimeStorage for SimulatorStorage {
-    type Entities = HeapEntityArena<32>;
-    type Callbacks = HeapCallbackArena<64>;
-    type Globals = HeapGlobalArena<8>;
-    type Frame = HeapFrame<64, 2_048>;
-    type ElementStates = HeapElementStates<256>;
-    type Events = HeapEvents;
-}
-```
-
-and, built without `alloc`, the very same simulator uses fixed tables:
-
-```rust
-#[cfg(not(feature = "alloc"))]
-pub(crate) type SimulatorStorage =
-    FixedStorage<16_384, 32, 8_192, 64, 2_048, 32_768, 256, 2_048, 8, 8, 8>;
-```
-
-`FixedStorage` has **eleven const generic parameters**, several with defaults
-(`const GLOBAL_BYTES: usize = 0`). It is a mouthful, but every byte the UI can
-use is visible in one line.
-
-Commit `f230425`, "choose runtime storage with a type instead of the alloc
-feature", explains why this design beat the old one. With a feature flag, every
-crate in the build had to agree: if *any* crate turned on `alloc`, everyone got
-heap storage. With a type, each `Runtime<S>` picks its own storage, both kinds
-can exist side by side in one program, and the tests can run the same code
-against both. That's what the `justfile`'s double test run from chapter 1 does,
-through this alias:
-
-```rust
-// unit tests run against the storage the `alloc` feature implies
-#[cfg(all(test, not(feature = "alloc")))]
-pub(crate) type TestEntityArena<const BYTES: usize, const SLOTS: usize> =
-    FixedEntityArena<BYTES, SLOTS>;
-#[cfg(all(test, feature = "alloc"))]
-pub(crate) type TestEntityArena<const BYTES: usize, const SLOTS: usize> = HeapEntityArena<SLOTS>;
-```
-
-## Rust concepts in this chapter
-
-- **`unsafe`**: what it allows, `# Safety` docs, `// SAFETY:` comments, and
-  module-level invariants.
-- **Raw pointers**, `NonNull`, `addr_of_mut!`, `ptr::drop_in_place`, and casting
-  pointers between types.
-- **Type erasure** with `TypeId`, `Layout` and monomorphised function pointers.
-- **Const generics** (`FixedMemory<const BYTES: usize>`), including defaults.
-- **`MaybeUninit`**, **`UnsafeCell`**, **`Cell`**, **`RefCell`**: the interior
-  mutability family.
-- **`#[repr(C, align(N))]`**, alignment, zero-sized types.
-- **Checked arithmetic**: `checked_add`, `ok_or`, `?`.
-- **Matching on tuples** and **match guards**.
-- **Panic safety**: updating state before calling user code that may unwind.
-- **Strategy types** and traits with associated types for configuration;
-  supertraits like `Deref<Target = [T]>`.
-
-## Try it yourself
-
-1. Install Miri (`rustup +nightly component add miri`) and run
-   `cargo +nightly miri test -p inkpaper-ui slot_table`. Then change
-   `addr_of_mut!((*storage).bytes)` to `&mut (*storage).bytes as *mut _` and look
-   for new warnings.
-2. In a test, create a `FixedEntityArena<64, 4>` (it's a test-only API, see
-   `entity/arena.rs`) and insert values until you get `StorageFull` or
-   `SlotsFull`. Predict which comes first for `u64` values, then for `[u8; 40]`.
-3. Write a type with a `Drop` impl that panics, insert it, and remove it inside
-   `std::panic::catch_unwind`. Use a counter to confirm the destructor ran only
-   once.
+The observable result of this code trace is two different error paths: `SlotsFull` and `StorageFull`. Add an imagined type aligned to 32 and find the third path, `UnsupportedAlignment`. No unsafe edits or hardware are needed. You are practicing the same budget reasoning that makes a repeatedly opened menu dependable.

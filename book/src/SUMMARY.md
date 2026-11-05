@@ -1,43 +1,43 @@
 # Summary
 
-[Introduction](introduction.md)
+[A page worth turning](introduction.md)
 
-# Part I — Starting from nothing
+# Part I — Describe a screen, give it state
 
-- [1. The project, the workspace and the toolbox](ch01-workspace.md)
-- [2. Day one: a UI API made of types](ch02-first-commit.md)
-- [3. Entities: state without `Rc<RefCell<T>>`](ch03-entities.md)
-- [4. An allocator-free arena](ch04-slot-table.md)
-- [5. Listeners: storing closures without `Box`](ch05-listeners.md)
+- [A page on your desk: the workspace](ch01-workspace.md)
+- [Describing a screen: a UI language of types](ch02-ui-language.md)
+- [Keeping the page alive: entities and state](ch03-entities.md)
+- [Making memory predictable: the slot table](ch04-slot-table.md)
+- [Giving a tap meaning: listeners and closures](ch05-listeners.md)
 
-# Part II — Making pixels
+# Part II — Make the screen respond
 
-- [6. From elements to a frame tree](ch06-frame-tree.md)
-- [7. Layout with integers](ch07-layout.md)
-- [8. Painting through a trait](ch08-painting.md)
-- [9. Drawing less: damage and invalidation](ch09-damage.md)
-- [10. Interaction and typed events](ch10-events.md)
+- [Giving the screen a memory](ch06-frame-tree.md)
+- [Making every pixel fit](ch07-layout.md)
+- [Turning rectangles into ink](ch08-painting.md)
+- [Changing the screen without disturbing the page](ch09-damage.md)
+- [From a finger to an intention](ch10-events.md)
 
-# Part III — Down to the metal
+# Part III — Meet the physical device
 
-- [11. Talking to chips: an embedded-hal driver](ch11-i2c-driver.md)
-- [12. E-paper displays: SPI, busy pins and timeouts](ch12-epaper.md)
-- [13. Firmware: an async main loop](ch13-firmware.md)
-- [14. Services: platforms, requests and replies](ch14-services.md)
+- [Asking the battery and clock](ch11-i2c-driver.md)
+- [Making the page visible](ch12-epaper.md)
+- [Keeping the reader awake to events](ch13-firmware.md)
+- [Slow work without tangled UI state](ch14-services.md)
 
-# Part IV — Books
+# Part IV — Turn a file into a reading experience
 
-- [15. Opening an EPUB: zip, XML and CSS](ch15-epub.md)
-- [16. Fonts and glyphs](ch16-fonts.md)
-- [17. Shaping text: Unicode, bidi and Arabic](ch17-shaping.md)
-- [18. The reader: pagination and positions](ch18-reader.md)
+- [Opening a book, not just a file](ch15-epub.md)
+- [Giving letters their ink](ch16-fonts.md)
+- [When text is more than letters](ch17-shaping.md)
+- [Keep my place, change the page](ch18-reader.md)
 
-# Part V — Ergonomics and speed
+# Part V — Make development clearer, make waiting measurable
 
-- [19. Macros: from `macro_rules!` to `rsx!`](ch19-macros.md)
-- [20. Measuring, and looking back](ch20-tracing-and-retrospective.md)
+- [Macros that make a screen readable](ch19-macros.md)
+- [Where the page-turn time goes](ch20-measuring.md)
 
 ---
 
-[Appendix A: Rust concept index](appendix-concepts.md)
-[Appendix B: Following along in git](appendix-git.md)
+[Appendix A: Find a Rust idea by its job](appendix-concepts.md)
+[Appendix B: A small reading lab](appendix-reading-lab.md)

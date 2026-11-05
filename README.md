@@ -158,9 +158,10 @@ The hardware development and flashing workflow is still evolving. Until it stabi
 
 ## Learning from the code
 
-The [`book/`](book/src/SUMMARY.md) folder holds *Building InkPaper*, a step-by-step
-book that follows the project's history to teach Rust with concrete examples from
-this repository, in chapters of 15 to 20 minutes. Read it on GitHub, or build it with
+The [`book/`](book/src/SUMMARY.md) folder holds *Building InkPaper*, a product-first
+journey through the current code. Short reading sessions explain how an e-reader
+works, which Rust concepts make it possible, and why the design choices matter,
+with small experiments to try in the repository. Read it on GitHub, or build it with
 [`mdbook`](https://github.com/rust-lang/mdBook):
 
 ```bash

@@ -1,80 +1,92 @@
-# Introduction
+# A page worth turning
 
-This book tells the story of how **InkPaper** was built, and uses that story to
-teach Rust.
+You tap the edge of a screen. The next paragraph appears, your place in the book
+is safe, and the device goes quiet again. An e-reader succeeds when you stop
+noticing the machine.
 
-InkPaper is experimental firmware for the XTEINK X4 PRO, a small e-reader with an
-800×480 e-paper panel, a capacitive touch screen, two side buttons, a frontlight,
-a battery gauge, a real-time clock, an SD card and an ESP32-S3 microcontroller.
-On top of that hardware sits a lot of software: a UI framework, an EPUB parser, a
-text shaper, a paginator, a dictionary, device drivers and an async firmware.
-All of it is written in Rust, most of it runs without the standard library, and
-almost all of it can also run on your laptop in a simulator.
+Making that experience feel simple is an excellent way to learn Rust. Someone
+must decide who owns the open book, how long a borrowed line of text remains
+valid, what happens when memory fills up, and how a slow display can coexist with
+responsive input. These are not language exercises dressed up as a product. They
+are product questions that lead naturally to ownership, traits, enums, lifetimes,
+and asynchronous work.
 
-That makes it a very good textbook. Every Rust feature in it is there to solve a
-real problem, and you can watch the problem appear in the git history before the
-feature shows up to solve it.
+**InkPaper** is experimental e-reader software for the XTEINK X4 PRO. Its Rust
+workspace contains an application, a UI framework, document and typography code,
+device drivers, firmware, and a desktop simulator. We will study that code as a
+working system, arranging the ideas in an order that makes them easier to learn.
+This is a guided construction of understanding, not a promise that typing the
+excerpts in sequence will recreate the repository.
 
-## Who this book is for
+## Begin with the reading experience
 
-You should be able to read basic Rust: functions, `struct`, `enum`, `match`,
-`impl`, and roughly what a reference is. You do **not** need to know embedded
-programming, `unsafe`, async, macros or traits in depth. Those are exactly the
-things the book teaches, one chapter at a time, using InkPaper's own code.
+Suppose the first requirement is simply “show a page of text.” A string is not a
+picture. The software must choose glyphs from a font, arrange them into lines,
+place those lines on a page, and turn their shapes into pixel values. On an
+e-paper device, even finished pixels are not the end of the job: a controller
+must drive the physical panel to make the new image visible.
 
-If you have read the first half of *The Rust Programming Language*, you are ready.
+That journey gives us a useful map. We begin at the application boundary, where
+we can describe a screen and try it on a laptop. We then follow that description
+toward pixels and hardware. With a place to display a page, we work back toward
+the book itself: opening an EPUB, understanding typography, and keeping a stable
+reading position when the layout changes. Finally, we look at tools that make
+the code easier to write and its performance easier to understand.
 
-## How the book is organised
+The order is deliberate. You do not need to understand an SPI transaction before
+you can experiment with a button. You do need to know what painting means before
+you can reason about avoiding unnecessary repainting. The chapters introduce
+those dependencies as they become useful.
 
-The chapters follow the order the project was actually built. The first commit,
-on 7 August 2026, contained a design document and about 300 lines of Rust. Three
-months and around 560 commits later it boots on real hardware, opens EPUBs from
-an SD card, hyphenates English, shapes Arabic and looks words up in a dictionary.
+## One idea at a time
 
-| Part | What gets built | Main Rust topics |
-|------|-----------------|------------------|
-| I. Starting from nothing | A declarative UI API, entities and storage | workspaces, `no_std`, traits, generics, `PhantomData`, `unsafe`, closures |
-| II. Making pixels | Frame tree, layout, painting, damage, events | enums, newtypes, operator overloading, trait objects, `TypeId` |
-| III. Down to the metal | Drivers, the e-paper bus, the firmware, services | `embedded-hal`, `async`/`await`, embassy, statics, channels |
-| IV. Books | EPUB, fonts, shaping, pagination | parsing bytes, error handling, Unicode, lifetimes, `Cow` |
-| V. Ergonomics and speed | Macros and tracing | `macro_rules!`, procedural macros, `Drop` guards, tooling |
+The book assumes you can read a Rust function, a `struct`, an `enum`, and a simple
+`match`. If those are unfamiliar, the opening chapters of
+[*The Rust Programming Language*](https://doc.rust-lang.org/book/) make a good
+companion. Embedded programming, advanced lifetimes, `unsafe`, and async are not
+prerequisites; we build their intuition around concrete problems here.
 
-Each chapter is meant to take **15 to 20 minutes** to read. Each one has:
+Aim for one chapter in a short sitting—roughly ten to fifteen minutes of reading,
+with experiments as a separate activity. Each session follows one problem far
+enough to explain the mechanism and its tradeoffs. You can stop when the central
+idea clicks rather than trying to memorise every type. The storage and shaping
+chapters are denser; taking them over two sittings loses nothing.
 
-- **Where we are**: the point in the history the chapter covers, with real
-  commit hashes you can check out.
-- The story: what problem came up and how the code solved it, with excerpts
-  from the repository. Excerpts are copied from the source. When one is shortened,
-  the text says so, and `// ...` marks what was left out.
-- **Rust concepts in this chapter**: what the chapter taught.
-- **Try it yourself**: small exercises you can do in the repository.
+Code excerpts point into the current repository. An excerpt shows the part worth
+studying, not necessarily a standalone program; shortened code and explanatory
+sketches are labelled. Run the repository's examples and the commands given in
+the exercises rather than pasting isolated method bodies into `main.rs`.
+[Appendix A](appendix-concepts.md) helps you revisit a Rust concept, and
+[Appendix B](appendix-reading-lab.md) offers a practical way to explore without
+getting lost in the source.
 
-## Running the code
+## Keep a working reader nearby
 
-You will get more out of the book if you keep the repository open next to it.
+From the repository root, with Rust and the simulator's
+[SDL2 prerequisites](https://github.com/embedded-graphics/simulator#setup)
+installed, run:
 
 ```bash
-git clone https://github.com/lyrocs/inkpaper
-cd inkpaper
-cargo test -p inkpaper-ui        # the UI framework's tests
-cargo run -p inkpaper-simulator  # the whole app in a desktop window
+cargo run -p inkpaper-simulator
 ```
 
-The simulator needs SDL2 (see the
-[`embedded-graphics-simulator`](https://crates.io/crates/embedded-graphics-simulator)
-instructions). Building the firmware needs the Xtensa toolchain, but no chapter
-requires it.
+Use the file browser to enter `/Fixtures` and open an EPUB such as
+`typography.epub`. These entries correspond to files in the repository's
+`fixtures/` directory. Other folders contain demonstration listings, so start
+with the fixtures when you want an actual book. The left and right arrow keys
+send previous and next actions, a left mouse click acts as touch input, and `H`
+returns home.
 
-[Appendix B](appendix-git.md) shows how to check out the historical commits
-the chapters mention, so you can see the code as it was at each step.
+You now have something concrete to question. What determines the gap between two
+lines? Why should a battery update leave the page alone? What survives when the
+font size changes? Keep one of those questions in mind as you read.
 
-## A note on style
+The simulator exercises application behavior without a board, but it does not
+reproduce e-paper waveforms, electrical faults, power consumption, or device
+timing. Hardware-specific chapters make that boundary explicit. No chapter
+requires you to flash a device. InkPaper remains experimental, and a supported
+fixture is evidence for a particular behavior—not a claim that every EPUB or
+writing system is fully supported.
 
-InkPaper's code has a recognisable voice. Comments are short, lowercase, and say
-*why* rather than *what*. Commit messages describe behaviour ("wait on the GT911
-interrupt instead of polling while idle") rather than files. Errors are values,
-not panics, until the last moment. Memory limits are written down as numbers.
-These habits are part of what this book tries to teach, so we point them out
-along the way.
-
-Let's start where the project started: an empty workspace.
+Our first task is modest: give ourselves a place to build and observe a screen.
+The Rust concepts will have a job to do from there.

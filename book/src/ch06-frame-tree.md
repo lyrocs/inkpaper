@@ -1,88 +1,20 @@
-# 6. From elements to a frame tree
+# 6. Giving the screen a memory
 
-> **Where we are:** commits `d597d3d` ("add fixed capacity frame tree lowering"),
-> `233876e` ("expand renderable entities into frame tree"), `46abc7e` ("add
-> persistent element identity resolution") and `ff9c003` ("add runtime frame
-> lifecycle"), 8 August 2026, the second day of the project.
+Open a reader's settings drawer, scroll its list, and change one option. You want the new choice to appear without the list jumping back to the top. The application may describe its controls again, but to your finger this is still the same drawer. A useful UI therefore needs two different kinds of memory: a working description of what is on screen, and an identity for the parts whose interaction state should survive change.
 
-## Two kinds of tree
+InkPaper's frame connects those needs. It turns the nested element values returned by `render` into a uniform tree that layout, painting, and input can share. The frame persists between runtime calls; it is not a fresh collection of pixels. Its nodes can be retained, replaced, or compacted while identified elements keep their meaning.
 
-So far we have two things:
+This session follows that translation. The source excerpts are internal definitions or function bodies, not standalone programs.
 
-- **Elements**: the strongly typed, nested values built by `div().child(...)`.
-  They are great for writing UIs: the compiler checks everything, and nothing
-  allocates. But every element tree has a *different type*, so you can't store
-  one in a field, walk it with a loop or keep it between frames.
-- **Entities**: persistent state that knows how to *render* elements.
+## A description becomes working storage
 
-Layout, hit testing and painting all need a third thing: one uniform data
-structure that you can walk in a loop, measure, annotate with positions and
-inspect when a tap arrives. InkPaper calls it the **frame**, and turning
-elements into a frame is called **mounting** (the early commits said
-"lowering", a compiler term for turning a high-level representation into a
-lower-level one).
+An element tree is pleasant to write because its Rust types describe its composition. A container with one text child and a container with several different children need not have the same concrete type. That is useful while constructing a UI, but awkward for the next job: visit every object, assign rectangles, and later find the object under a tap.
 
-```text
-Render::render()  ──►  element tree (typed, temporary)
-                              │ Element::mount()
-                              ▼
-                       frame tree (uniform, indexed)
-                              │
-               ┌──────────────┼──────────────┐
-               ▼              ▼              ▼
-            layout       hit testing       paint
-```
+Mounting converts those varied values into frame nodes. All nodes have one Rust type; a `NodeKind` enum distinguishes containers, text, images, SVGs, canvases, and entity boundaries. Unlike an open trait that application code can implement, this enum is a closed vocabulary of operations the framework understands. Layout and painting can match on it exhaustively. An application can invent another component without inventing another fundamental paint operation.
 
-## A node is an enum
+Here is the beginning of `Node` in `crates/ui/src/frame/mod.rs`, an exact excerpt with its remaining fields omitted:
 
-Every frame node has the same Rust type, and an enum carries the differences:
-
-```rust
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum NodeKind {
-    Div { style: Style },
-    Text { text: TextRange },
-    Image { source: ImageSource, style: ImageStyle },
-    Svg { source: SvgSource, style: SvgStyle },
-    Canvas { draw: CanvasDraw, style: CanvasStyle },
-    Entity {
-        entity: EntityId,
-        render: EntityRenderFn,
-        expanded: bool,
-    },
-}
-```
-
-This is the standard way to give a closed set of things one type in Rust. A
-`match` on `NodeKind` must handle every variant, so when the SVG variant was added
-in September, the compiler listed every place that needed updating. Compare this
-with chapter 2's open-ended `Element` trait, which anyone can implement. Traits
-are good for *open* sets, and enums for *closed* ones. Elements are open (apps
-define components), while frame nodes are closed (only the framework knows how to
-lay out and paint).
-
-Notice `#[derive(Clone, Copy)]` on `NodeKind`. Every variant holds only small
-`Copy` data. Text in particular is not a `&str` or a `String` but a `TextRange`:
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TextRange {
-    start: usize,
-    len: usize,
-}
-```
-
-The frame keeps one big byte buffer for *all* text, and a text node just remembers
-its slice of it. That keeps nodes small and `Copy`, gives text one bounded pool of
-memory, and avoids lifetimes on the frame. A frame that contained `&'a str` would
-need `'a`, and so would everything that touches it.
-
-## Indices instead of pointers
-
-Here is a node:
-
-```rust
-#[derive(Debug, Clone, Copy)]
+```rust,ignore
 pub(crate) struct Node {
     pub(crate) kind: NodeKind,
     pub(crate) parent: Option<NodeId>,
@@ -90,86 +22,24 @@ pub(crate) struct Node {
     pub(crate) last_child: Option<NodeId>,
     pub(crate) next_sibling: Option<NodeId>,
     pub(crate) element_id: Option<ElementId>,
+    pub(crate) element_state_id: Option<ElementStateId>,
+    pub(crate) interaction: NodeInteraction,
     pub(crate) layout: NodeLayout,
-    // ...
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId(u16);
 ```
 
-A tree needs links between nodes: parent, children, siblings. In C you would use
-pointers. In Rust, a tree where children point to parents *and* parents point to
-children fights the ownership model: who owns whom? The usual options are
-`Rc<RefCell<Node>>` with `Weak` back-pointers (heap, runtime checks, verbosity) or
-`unsafe` raw pointers.
+The links are indices, not references into independently allocated nodes. `NodeId` wraps a `u16`; the arena owns the storage. This avoids a network of shared owners and mutable reference-counted cells merely to represent parent and child links. It also makes storage policy separable from tree structure: fixed-capacity and heap-backed storage can serve the same representation.
 
-InkPaper uses the third option, the one most Rust projects with complex graphs
-settle on: **store all nodes in one vector and link them with indices**. A
-`NodeId` is a `u16` index into that vector. Because all links are plain numbers:
+There is a cost. A numeric link does not prove that it points to the right node. The frame implementation must maintain its invariants. `append_child` requires an unattached child, rejects self-parenting with a debug assertion, and preserves sibling append order. `first_child` and `next_sibling` provide the walk; `last_child` makes appending possible without scanning every existing child. Tree order is not necessarily arena order, especially after a partial rebuild.
 
-- nodes are `Copy` and the whole tree can be cleared in O(1);
-- there is exactly one owner, the frame's vector, and the borrow checker is happy;
-- a `u16` link is 2 bytes instead of 4 or 8 for a pointer, and
-  `Option<NodeId>` is 4.
+## Borrowed words become owned bytes
 
-The children are stored as a **singly linked list**: `first_child`, then
-`next_sibling` from child to child. `last_child` exists so appending is O(1). This
-"first child, next sibling" layout represents any tree with a fixed number of
-fields per node, which is exactly what fixed-capacity storage needs.
+A render method may produce text from temporary values. The frame cannot keep a borrowed string after its owner disappears. Giving the entire frame a lifetime tied to every label would spread that restriction through the runtime.
 
-Walking the children of a node is a loop over `Option<NodeId>`:
+Instead, mounting copies text bytes into a frame-owned buffer. Nodes hold a small `TextRange` containing a start offset and length. That makes a text node independent of the original string's lifetime, at the price of a copy and storage in the frame's text pool. It is not a claim that UI text is free; it is an explicit place to pay for ownership.
 
-```rust
-let mut current = self.node(parent).first_child;
+The exact `push_text` implementation in `crates/ui/src/frame/mount.rs` is short enough to read whole:
 
-while let Some(child) = current {
-    // ... use child ...
-    current = self.node(child).next_sibling;
-}
-```
-
-`while let` keeps looping as long as the pattern matches. You'll find this loop in
-many places in the layout code.
-
-## Mounting
-
-Mounting goes through `MountCx`, the mount context:
-
-```rust
-pub struct MountCx<'a> {
-    frame: &'a mut dyn FrameStore,
-    app: AppContext<'a>,
-}
-```
-
-`&'a mut dyn FrameStore` is a **trait object**: a reference to *some* type
-that implements `FrameStore`, chosen at runtime. Why `dyn` here when the rest of
-the framework is so generic? Because `FrameArena<F>` is generic over its storage
-`F`. If `MountCx` were generic too, every `Element::mount` implementation in every
-app crate would have to be generic over the storage type, and each element would
-be compiled once per storage. The trait object hides that parameter behind a
-vtable. You pay one indirect call per node pushed, and in exchange the element
-API stays simple and the code stays small. That's a good trade on a
-microcontroller, where code size matters.
-
-The `FrameStore` trait lists what an element can do while mounting:
-
-```rust
-pub(crate) trait FrameStore {
-    fn push_div(&mut self, style: Style) -> Result<NodeId, MountError>;
-    fn push_text(&mut self, text: &str, style: TextStyle) -> Result<NodeId, MountError>;
-    fn push_entity(&mut self, entity: EntityId, render: EntityRenderFn)
-        -> Result<NodeId, MountError>;
-    fn append_child(&mut self, parent: NodeId, child: NodeId);
-    fn identify(&mut self, node: NodeId, id: ElementId);
-    // ...
-}
-```
-
-And here is how a text node is pushed:
-
-```rust
+```rust,ignore
 fn push_text(&mut self, text: &str, style: TextStyle) -> Result<NodeId, MountError> {
     let start = self.text.len();
 
@@ -195,151 +65,38 @@ fn push_text(&mut self, text: &str, style: TextStyle) -> Result<NodeId, MountErr
 }
 ```
 
-Look at the error path. The text is copied first. If the node table is full,
-`truncate(start)` rolls the text buffer back, so a failed mount leaves no garbage
-behind. This is the "strong exception guarantee" from C++: an operation either
-fully succeeds or leaves the state unchanged. In Rust, with explicit `Result`s, you
-can *see* every early return, so it's easy to check that each one cleans up.
+`Result` makes two capacity failures visible. The text buffer may reject the bytes; if it accepts them but node insertion fails, `truncate(start)` gives those bytes back. The `?` operator propagates the first failure, while the second needs explicit cleanup. Notice the narrowness of the guarantee: this insertion rolls back its text on node failure. It does not mean every larger rebuild is transactional. The partial-rebuild implementation explicitly says an error can leave the frame inconsistent and requires clearing it.
 
-Also note `text.len()`, which counts **bytes**, not characters. Rust strings are
-UTF-8, and `str::len` is the byte length. `TextRange` stores byte offsets, which is
-what slicing (`&text[start..start + len]`) needs. Chapter 17 is all about the
-difference between bytes, characters and what a reader would call a "letter".
+Both offsets count bytes. Rust's `str::len()` does not count visible letters. Because the bytes come from valid strings and ranges are recorded at insertion boundaries, the frame can recover the original UTF-8 slice. Layout will worry about what those bytes look like; storage only needs to preserve them accurately.
 
-### Building the links
+## Keeping the parts that did not change
 
-`append_child` turns two node ids into a parent/child relation:
+Mounting an entity inserts an entity node carrying its `EntityId`, a render function pointer, and an `expanded` flag. It does not immediately recurse through every nested entity. The expansion loop in `crates/ui/src/frame/rerender.rs` scans appended nodes and renders unexpanded entities. Rendering may append further entity nodes, which the same loop will eventually reach.
 
-```rust
-fn append_child(&mut self, parent: NodeId, child: NodeId) {
-    let parent_idx = parent.index();
-    let child_idx = child.index();
-    // a child may be mounted before its parent, so an existing subtree can be
-    // attached under a newly mounted node
-    debug_assert!(child != parent, "a frame node cannot be its own child");
-    debug_assert!(
-        self.nodes[child_idx].parent.is_none(),
-        "a frame node can only be attached once"
-    );
+This is a useful distinction between describing a boundary and executing the work behind it. A stored function pointer lets the uniform frame call the correctly typed render implementation without giving every frame node a different Rust type. Iterating over pending entity nodes also avoids recursive *entity expansion*, although this does not promise that every operation involved in constructing elements is nonrecursive.
 
-    self.nodes[child_idx].parent = Some(parent);
+When an entity needs to render again, its old content is detached and replacement nodes are appended. Unchanged child entities can retain their content. This exact portion of the expansion loop shows the reuse decision:
 
-    match self.nodes[parent_idx].last_child {
-        Some(last) => {
-            debug_assert!(
-                child_idx > last.index(),
-                "frame siblings must be mounted in append order"
-            );
-            self.nodes[last.index()].next_sibling = Some(child)
-        }
-        None => self.nodes[parent_idx].first_child = Some(child),
-    }
-
-    self.nodes[parent_idx].last_child = Some(child);
-}
-```
-
-`debug_assert!` checks are compiled in debug builds and tests and removed in
-release builds. They document the *assumptions* this function relies on (no
-cycles, no double attachment, append order) at zero cost to the firmware.
-That's a middle ground between "trust me" comments and full runtime checks.
-
-## Entities become nodes too
-
-When an element tree contains an `Entity<T>` (for example
-`.child(self.battery_indicator)`), mounting doesn't render it right away. It pushes
-an `Entity` node that remembers *how* to render later:
-
-```rust
-impl<T> Element for Entity<T>
-where
-    T: Render,
-{
-    fn mount(self, cx: &mut MountCx<'_>) -> Result<NodeId, MountError> {
-        cx.push_entity(self.entity_id(), render_entity::<T>)
-    }
-}
-```
-
-`render_entity::<T>` is the same trick as chapter 5's trampolines. The node stores
-an `EntityRenderFn`, a plain function pointer:
-
-```rust
-pub(crate) type EntityRenderFn = fn(
-    entity: EntityId,
-    runtime: RuntimeCx<'_>,
-    frame: &mut dyn FrameStore,
-) -> Result<NodeId, MountError>;
-```
-
-and the monomorphised `render_entity::<T>` behind it borrows the entity, calls
-`T::render`, and mounts the result:
-
-```rust
-let state = unsafe { &mut *borrow.ptr().cast::<T>().as_ptr() };
-let entity = Entity::<T>::from_id(entity_id);
-let runtime = runtime.rendering(entity_id);
-let mut cx = Context::new_in(entity, runtime);
-let element = state.render(&mut cx).into_element();
-let app = AppContext::from_runtime(runtime);
-let mut mount_cx = MountCx::new(frame, app);
-
-element.mount(&mut mount_cx)
-```
-
-Why the delay? Because expansion then happens **breadth-first in a loop**
-instead of by recursion:
-
-```rust
-while index < self.nodes.len() {
-    let Ok(raw) = u16::try_from(index) else {
-        break;
-    };
-    let node = NodeId::new(raw);
-    index += 1;
-
-    let NodeKind::Entity {
-        entity,
-        expanded: false,
-        ..
-    } = self.node(node).kind
-    else {
+```rust,ignore
+if let Some(previous) = self.take_detached_entity(entity) {
+    if !runtime.entities.needs_render(entity) {
+        self.move_content(previous, node);
         continue;
-    };
+    }
 
-    // ... reuse the previous content if the entity doesn't need to render ...
-
-    self.render_entity_node(node, runtime)?;
+    self.detach_content(previous)?;
 }
+
+self.render_entity_node(node, runtime)?;
 ```
 
-Rendering an entity appends new nodes to the end of the vector, possibly more
-unexpanded entities, and the loop simply keeps going until it reaches the end.
-The stack depth doesn't grow with the depth of the UI, which matters on a
-microcontroller with a few kilobytes of stack per task. The pattern in the
-`let ... else` is worth reading closely, too. `expanded: false` inside a struct
-pattern matches only nodes whose field *equals* `false`, and `..` ignores the
-remaining fields.
+`if let` opens the optional previous location. `continue` means that retained content is already sufficient; no render call follows. The arena is compacted after the rebuild to remove detached storage. Consequently, even a frame that persists cannot promise stable node indices. `NodeId` is a working address inside the current representation, not a durable name for a button.
 
-It also gives a natural place to plug in the partial rebuilds of chapter 9. The
-`needs_render` check above lets an entity that didn't change keep its previous
-nodes.
+## Names that outlive positions
 
-`push_entity` refuses to mount the same entity twice in one frame
-(`MountError::DuplicateEntityMount`). An entity has one place in the tree. If two
-nodes rendered the same state, a tap on either would be ambiguous.
+The scrolled drawer needs the durable name. InkPaper separates an element's local `ElementId` from its resolved `ElementStateId`. The identity key combines the local name with a parent identity, using these exact definitions from `crates/ui/src/element/state/mod.rs`:
 
-## Identity that survives frames
-
-The frame is rebuilt often, and its `NodeId`s are just positions, so they change.
-Yet some things must survive between frames: how far a list is scrolled, which
-element is being pressed. Commit `46abc7e` introduced **persistent element
-identity**.
-
-When an element has `.id(...)`, the runtime looks up its state with a key made of
-the element's id *and its parent's identity*:
-
-```rust
+```rust,ignore
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdentityParent {
     Entity(EntityId),
@@ -353,69 +110,14 @@ pub(crate) struct ElementStateKey {
 }
 ```
 
-So two rows that are both called `("row", 3)` but sit in different lists are
-different elements, much like two files named `notes.txt` in different
-folders. Each entry also records its **scope**, the nearest entity above the element, and
-the frames in which it was seen. When that entity renders again, the entries it no
-longer produced are swept, so a list that disappears doesn't leak its scroll
-state.
+The resolver walks upward to the nearest identified ancestor or entity boundary. Unnamed wrappers do not add a scope. Two controls with the same local name can therefore be different controls under different identified parents; inserting an unnamed layout wrapper need not rename everything beneath it. Identifying that wrapper, however, changes the identity path. Identity is part of the UI's behavior, not decorative metadata.
 
-## Errors as values
+The state table also records the owning entity scope and when entries were seen. When an entity renders again, state for elements it no longer produces can be swept rather than accumulating indefinitely. Scroll offsets and pressed state refer to resolved identities, allowing the frame representation to move independently.
 
-Every step in this chapter returns `Result<_, MountError>`:
+One alternative is to retain every widget object and mutate it in place. That can make identity straightforward but ties construction, state, and traversal together. Another is to rebuild everything and restore state by array position. That is simple until insertion makes yesterday's third row today's fourth. InkPaper instead retains a working frame while assigning explicit meaning to the elements that need continuity. The application must choose those names thoughtfully, but storage addresses no longer masquerade as user-visible identity.
 
-```rust
-pub enum MountError {
-    NodesFull,
-    TextStorageFull,
-    EventBindingsFull,
-    /// too many nodes have focused or pressed styles
-    InteractionStylesFull,
-    EntityAccess(EntityAccessError),
-    DuplicateEntityMount(EntityId),
-    /// heap-backed storage could not allocate
-    AllocationFailed,
-}
+## Try it: move a wrapper, not a control
 
-impl From<EntityAccessError> for MountError {
-    fn from(value: EntityAccessError) -> Self {
-        Self::EntityAccess(value)
-    }
-}
-```
+For an optional hardware-free trace, open `identity_parent` and `resolve_identities` in `crates/ui/src/frame/resolve.rs`. On paper, place an identified `row` beneath an entity, with one unnamed container between them. Follow the upward loop: the row's parent identity is the entity. Add another unnamed container and repeat; the result is unchanged. Now give the intermediate container an identity. The row resolves beneath that element's state instead.
 
-That `From` impl is what lets `?` convert errors automatically. Inside a
-function returning `Result<_, MountError>`, writing `RawEntityBorrow::acquire(...)?`
-on a `Result<_, EntityAccessError>` calls `MountError::from` for you. Small error
-enums plus `From` conversions are the usual Rust style in `no_std` code, where
-`Box<dyn Error>` isn't available.
-
-On a device with fixed tables, "the UI didn't fit" is a real, expected outcome.
-The runtime reports it, the platform can log it, and the developer raises a
-capacity in the `RuntimeStorage` configuration from chapter 4. Nothing corrupts
-memory, and nothing allocates behind your back.
-
-## Rust concepts in this chapter
-
-- **Enums for closed sets, traits for open sets.**
-- **Index-based trees** (arena + `u16` ids) instead of `Rc`/`Weak` or raw
-  pointers; first-child/next-sibling layout.
-- **`while let`** loops over `Option` links.
-- **Trait objects** (`&mut dyn FrameStore`) to keep APIs non-generic and code small.
-- **Function pointers** (`fn(...) -> ...`) as stored behaviour.
-- **Struct patterns with literal fields** (`expanded: false`) and `..`.
-- **Iteration instead of recursion** to bound stack depth.
-- **`debug_assert!`** for documented, zero-cost-in-release invariants.
-- **Error enums**, **`From` for `?` conversions**, rolling back on error.
-- **Bytes versus characters** in `str::len`.
-
-## Try it yourself
-
-1. In `crates/ui/src/frame/tests.rs`, find a test that mounts a tree. Add a
-   helper that prints each node's kind with indentation by walking
-   `first_child`/`next_sibling`.
-2. Configure a runtime with `FixedFrame<4, 64>` (four nodes) and render a div with
-   five children. Which `MountError` do you get? Where would you change the
-   capacity in a real app?
-3. Remove the `self.text.truncate(start)` line in `push_text` and write a test
-   showing why it was needed.
+The observable outcome is the selected `IdentityParent` branch, not a screenshot. You should be able to explain why moving a `NodeId` during compaction need not change this key, while changing an identified ancestor can. That distinction is what lets the drawer change its contents without forgetting where your finger left it.

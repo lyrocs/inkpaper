@@ -1,64 +1,18 @@
-# 8. Painting through a trait
+# 8. Turning rectangles into ink
 
-> **Where we are:** commit `c3e72a5` ("add embedded-graphics frame renderer") and
-> `b6a0814` ("add desktop UI simulator example"), 9 August 2026. The next day,
-> `aee8a87` ("decouple painting from embedded-graphics") introduced the
-> `Painter` trait. In September and October the e-ink backend grew
-> (`137c021`, `fa0ff9f`) and finally moved into its own crate (`d113331`,
-> "move the eink backend into its own crate", 17 October).
+The settings drawer is now laid out: every row has a rectangle, the text has a width, and the overlay covers the page beneath it. None of that has changed a pixel. Layout describes where things belong; painting must turn those descriptions into visible marks.
 
-## The first pixels
+On a desktop, those marks are RGB pixels in a simulator display. On the reader, they are shades in an e-paper framebuffer, which the display controller will later transfer to the panel. We want the same drawer on both, but not necessarily the same low-level drawing strategy. A rectangle fill, a soft glyph edge, and a photograph have different opportunities for optimization and different consequences on e-paper.
 
-At the end of day three the framework could lay out a tree, and someone wanted to
-*see* it. The quickest route was
-[`embedded-graphics`](https://crates.io/crates/embedded-graphics), the standard
-2D drawing library for embedded Rust. Its central abstraction is a trait:
+The boundary between those concerns is `Painter`. This session reads that boundary and the simulator's actual paint loop. Source excerpts are not standalone programs; the small complete function shown near the end still depends on its module's imports and constants.
 
-```rust
-// from embedded-graphics (simplified)
-pub trait DrawTarget: Dimensions {
-    type Color: PixelColor;
-    type Error;
+## Ask for a box, not a thousand pixels
 
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Self::Color>>;
+A UI framework knows more than “set this pixel.” It knows that a shape is a box, that it has a background and border, and that it is clipped to a visible region. Keeping that information until the backend can use it is valuable. A backend may fill spans efficiently or translate colors according to its medium.
 
-    // fill_contiguous, fill_solid and clear have default implementations
-}
-```
+This shortened excerpt from `crates/ui/src/rendering/paint/mod.rs` shows three methods of the actual trait; its canvas and pixel-row methods are omitted:
 
-Every display driver in the ecosystem implements `DrawTarget`, and so does
-`embedded-graphics-simulator`, which opens an SDL window on your desktop. So one
-renderer written against `DrawTarget` can draw both to a window and to a real
-panel.
-
-Commit `c3e72a5` did exactly that, and `b6a0814` added a desktop example. From
-then on, every feature could be tried in a window seconds after it compiled.
-The simulator became the project's main development tool, long before there was
-any firmware.
-
-## Why add another trait?
-
-Only one day later, `aee8a87` "decoupled painting from embedded-graphics". Why
-wrap a perfectly good trait in another one?
-
-Because `DrawTarget` speaks in *pixels*, and a UI framework wants to speak in
-*operations*: "draw this box with these rounded corners and this border, clipped
-to this rectangle"; "draw this glyph's coverage in this colour". Expressing those
-operations directly makes three things possible:
-
-- a backend can implement an operation natively and faster (filling a whole
-  rectangle of a 1-bit framebuffer with byte writes, not pixel by pixel);
-- a backend can interpret an operation for its medium (on e-ink, a grey
-  becomes a dither pattern or a native grey level);
-- the core crate no longer *depends* on `embedded-graphics`. Look back at
-  chapter 1: it's an **optional** dependency behind the `embedded-graphics`
-  feature.
-
-Here is the trait today:
-
-```rust
+```rust,ignore
 pub trait Painter {
     type Error;
 
@@ -69,14 +23,6 @@ pub trait Painter {
         clip: Option<Rect>,
     ) -> Result<(), Self::Error>;
 
-    fn draw_canvas(
-        &mut self,
-        bounds: Rect,
-        clip: Option<Rect>,
-        draw: &mut dyn FnMut(Rect, &mut dyn CanvasPainter),
-    ) -> Result<(), Self::Error>;
-
-    /// draws a rasterized glyph's coverage in `color`, its top-left corner at `origin`
     fn draw_glyph(
         &mut self,
         bitmap: &GlyphBitmap<'_>,
@@ -86,52 +32,20 @@ pub trait Painter {
     ) -> Result<(), Self::Error>;
 
     fn fill_rect(&mut self, rect: Rect, color: Color, clip: Rect) -> Result<(), Self::Error>;
-
-    /// draws a row of final image colors left to right from `origin`. They're already
-    /// clipped
-    fn draw_pixels(&mut self, origin: Point, pixels: &[Color]) -> Result<(), Self::Error>;
 }
 ```
 
-### Associated error types
+`BoxPaint` carries the visual properties, while `bounds` carries geometry. Keeping them separate means painting need not repeat layout. A glyph arrives as coverage: how much of each pixel belongs to the letter. The backend decides how that coverage becomes marks against the destination. Images ultimately arrive through `draw_pixels` as rows of final colors that are already clipped.
 
-`type Error;` lets each implementation choose its own error type. A simulator
-display can't fail, so its error is `core::convert::Infallible`, an enum with no
-variants, which no value can ever have. An SPI-backed display might fail with a bus
-error. The framework doesn't need to know. It returns whatever the painter
-returns, wrapped in its own enum:
+The associated `Error` type lets the implementation describe its own failure. The runtime can return `PaintError<P::Error>` without requiring every painter to share one error enum. That wrapper distinguishes a painter failure from font-cache and shaping failures. An infallible drawing target can use `Infallible`; this does not make the entire text-painting pipeline infallible.
 
-```rust
-/// why painting stopped: the painter failed, or text couldn't be rasterized or shaped
-#[derive(Debug)]
-pub enum PaintError<E> {
-    Painter(E),
-    Font(GlyphCacheError),
-    Shape(ShapeError),
-}
-```
+A single pixel-writing trait would be smaller, but would throw away useful structure early. Conversely, asking the backend to understand whole application widgets would tie it to the app. This trait sits between those extremes: enough meaning for efficient drawing, not enough to decide what a settings drawer does.
 
-`PaintError<E>` is **generic over the inner error**. `PaintError<Infallible>`
-and `PaintError<SpiError>` are different types, and a function painting with
-painter `P` returns `Result<_, PaintError<P::Error>>`. That's the standard way to
-compose errors across a library boundary without boxing them. You'll see the same
-shape in the drivers of Part III (`Error<E>`) and in the EPUB parser
-(`Error<S::Error>`).
+## A backend borrows its destination
 
-### A closure as a parameter
+The embedded-graphics adapter connects `Painter` to an ecosystem `DrawTarget`. Its state is small. This exact declaration comes from `crates/ui/src/backend/embedded_graphics/mod.rs`:
 
-`draw_canvas` takes `draw: &mut dyn FnMut(Rect, &mut dyn CanvasPainter)`. A
-canvas callback (chapter 5) needs to issue arbitrary drawing commands, and the
-painter needs to set up clipping around it. So the painter receives the callback
-as a **trait object of a closure**. Here `dyn` keeps `Painter` *object-safe* with
-respect to this method: a generic `fn draw_canvas<F: FnMut(...)>` would make
-every painter generic over every canvas closure type.
-
-## The embedded-graphics painter
-
-The first backend adapts `Painter` to any `DrawTarget`:
-
-```rust
+```rust,ignore
 pub struct EmbeddedGraphicsPainter<'target, D>
 where
     D: EgDrawTarget,
@@ -139,133 +53,42 @@ where
     target: &'target mut D,
     coverage_mode: CoverageMode<D>,
 }
-
-impl<D> Painter for EmbeddedGraphicsPainter<'_, D>
-where
-    D: EgDrawTarget,
-    D::Color: From<EgRgb888>,
-{
-    type Error = D::Error;
-
-    fn draw_box(
-        &mut self,
-        bounds: Rect,
-        paint: BoxPaint,
-        clip: Option<Rect>,
-    ) -> Result<(), Self::Error> {
-        let mut target = self.target.color_converted::<EgRgb888>();
-
-        if let Some(clip) = clip {
-            let clip = to_embedded_rect(clip);
-            let mut clipped = target.clipped(&clip);
-            draw_box_to(&mut clipped, bounds, paint, to_rgb888)
-        } else {
-            draw_box_to(&mut target, bounds, paint, to_rgb888)
-        }
-    }
-    // ...
-}
 ```
 
-Three things to notice.
+The lifetime says that the painter cannot outlive its borrowed target. The mutable reference gives it exclusive access through that borrow, rather than shared access guarded by a lock. The type parameter `D` allows the same adapter to work with different display implementations. Its `Painter` implementation additionally requires `D::Color: From<EgRgb888>`: the target's color type must accept the RGB representation used by this backend.
 
-**The painter borrows the display.** `target: &'target mut D` means a painter
-can't outlive the display it draws on, and while it exists nobody else can draw
-on that display. A painter is created for one frame and dropped after.
+Within `draw_box`, target adapters perform color conversion and clipping. These are ordinary values wrapping a draw target, not another application tree. Generic wrappers give the compiler opportunities to inline the work, but they do not make conversion or clipping conceptually disappear. Each backend still needs to honor the same visible bounds.
 
-**Bounds on associated types.** `where D::Color: From<EgRgb888>` says "this works
-for any draw target whose pixel colour can be built from 24-bit RGB". The UI
-thinks in `Color { r, g, b }`, and whether the target is an RGB window or a
-grayscale panel, the conversion is the target's business.
+There is a deliberate contrast in the canvas method. It receives a `&mut dyn FnMut(Rect, &mut dyn CanvasPainter)` callback. The concrete closure type is hidden, letting the backend establish a drawing context and then run application-supplied commands through a limited interface. Here a trait object avoids making the operation generic over every callback type. InkPaper uses both generics and dynamic dispatch where their different costs fit; “always avoid `dyn`” would be a poor explanation of this API.
 
-**Adapters as values.** `color_converted()` and `clipped()` come from
-embedded-graphics. Each wraps the target in a new `DrawTarget` that converts
-colours or discards pixels outside a rectangle. It's the iterator-adapter idea
-(`map`, `filter`) applied to drawing. Because the wrappers are generic structs, the
-compiler inlines them, so clipping costs a comparison per pixel and nothing more.
+## Fonts are resources, not display drivers
 
-## The `()` resource set
+A framebuffer does not know how to turn UTF-8 into positioned glyphs. Nor should a draw target own the application's image registry. `PaintResources`, alongside `Painter`, handles those resources and translates text and images into drawing operations.
 
-Painting text and images needs fonts and images, which are big, optional, and
-different on each platform. The runtime is generic over a second parameter for
-them, `Runtime<S, RESOURCES = ()>`, bounded by a trait:
+The exact text entry point from `crates/ui/src/rendering/paint/mod.rs` makes both responsibilities visible:
 
-```rust
-pub trait PaintResources {
-    fn paint_text<P: Painter>(
-        &mut self,
-        painter: &mut P,
-        text: &str,
-        bounds: Rect,
-        style: ResolvedTextStyle,
-        clip: Option<Rect>,
-    ) -> Result<(), PaintError<P::Error>>;
-
-    fn paint_image<P: Painter>(
-        &mut self,
-        painter: &mut P,
-        source: ImageSource,
-        bounds: Rect,
-        paint: ImagePaint,
-        clip: Option<Rect>,
-    ) -> Result<(), PaintError<P::Error>>;
-    // ...
-}
-
-/// no fonts or images: text and image nodes paint nothing
-impl PaintResources for () {
-    fn paint_text<P: Painter>(
-        &mut self,
-        _: &mut P,
-        _: &str,
-        _: Rect,
-        _: ResolvedTextStyle,
-        _: Option<Rect>,
-    ) -> Result<(), PaintError<P::Error>> {
-        Ok(())
-    }
-    // ...
-}
+```rust,ignore
+fn paint_text<P: Painter>(
+    &mut self,
+    painter: &mut P,
+    text: &str,
+    bounds: Rect,
+    style: ResolvedTextStyle,
+    clip: Option<Rect>,
+) -> Result<(), PaintError<P::Error>>;
 ```
 
-**Implementing a trait for the unit type `()`** is a neat trick: it provides a
-"do nothing" implementation that costs zero bytes. With the default type
-parameter `RESOURCES = ()`, unit tests and benchmarks that only care about layout
-write `Runtime<TestStorage>` and never think about fonts.
+This method is generic over the destination painter. The text machinery can shape and rasterize using its own resources, then send glyph coverage to whatever backend the platform chose. Later sessions will examine the shaping work; here the important observation is that changing the destination need not change the application's words.
 
-`PaintResources` methods are **generic** (`<P: Painter>`), unlike `draw_canvas`
-above. These methods are called from inside the paint loop for every text node,
-so each painter gets its own fully inlined copy. The trade-off is the opposite of
-`MountCx` in chapter 6, and that's fine. Choosing between `dyn` and generics is a
-per-call-site decision about code size versus speed.
+There is also a `PaintResources` implementation for `()`, Rust's unit type. It intentionally paints no text or images. That is useful for layout-only tests and graphics-only runtimes, but it is not a fallback font system. If boxes appear while text is absent, the selected resources are part of the investigation.
 
-## Walking the tree without recursion
+Painting visits the visual tree in parent-before-child order, so later content can cover earlier content. The shared traversal applies scrolling and clipping, and input uses the same visual interpretation. Its continuation storage is bounded; if the small stack fills, the implementation recomputes context by climbing ancestors rather than silently dropping the rest of the tree. The trade is bounded storage for occasional extra traversal work, not a hard promise that deeply nested content stops existing.
 
-Painting visits nodes in tree order: parent first, then children, so children
-draw on top. The natural way to write that is recursion, but each recursive
-call needs stack, and on the ESP32-S3 the main task's stack is a few kilobytes.
-Commit `d32997d`, "bound visual traversal stack", made the walk iterative with
-an explicit stack of fixed capacity:
+## Painting is not refreshing
 
-```rust
-const VISUAL_CONTEXT_STACK_CAPACITY: usize = 16;
+The simulator's `render_ui`, in `crates/sim/src/render.rs`, provides a compact view of the pipeline. This is the exact function, excluding its documentation comment:
 
-// ...
-    branch_continuations: Vec<VisualContinuation, VISUAL_CONTEXT_STACK_CAPACITY>,
-```
-
-That's a `heapless::Vec`: a vector with inline storage and a capacity fixed by a
-const generic. `push` returns `Err` when it's full instead of reallocating. The
-stack only holds entries for *branches that still have siblings to visit*, so its
-depth is bounded by the number of nested containers that still have work left,
-not by the total depth of the tree.
-
-## The simulator's paint loop
-
-Here is the whole render function of the simulator (`crates/sim/src/render.rs`):
-
-```rust
-/// paints what changed since the last frame
+```rust,ignore
 pub(super) fn render_ui<R>(runtime: &mut R, display: &mut SimulatorDisplay<Rgb888>)
 where
     R: RenderRuntimeApi,
@@ -290,95 +113,16 @@ where
 }
 ```
 
-There are three steps. *Prepare* the frame (rebuild and lay out what changed),
-which returns the **damage**, the region that needs repainting. *Clear* that
-region. *Paint* into it. Chapter 9 is entirely about that damage value.
+Preparation performs the rebuild and layout work that pending invalidation requires. It returns damage: the region needing new pixels. No damage means no painting. Otherwise the caller clears that region and paints the current frame into it. Clearing matters when a label shrinks or a control disappears; drawing only the new content would leave the old marks behind.
 
-`R: RenderRuntimeApi` hides the runtime's two type parameters behind a trait.
-This function works with any storage and any resources, which matters because
-the simulator can be built with heap or fixed storage (chapter 4).
+The coverage mode uses a pixel-reading function so glyph edges can blend with pixels already in the simulator display. It is a rendering choice, not a simulation of physical panel timing. The function's panic paths are also platform policy: it treats rendering failure as fatal rather than presenting recovery UI.
 
-`CoverageMode::alpha_blend(read_simulator_pixel)` passes a **function** that reads
-back a pixel from the display, so antialiased text edges can be blended with
-whatever is already there. On the device, commit `0639587` ("let the painter read
-framebuffer pixels back") added the same ability for e-ink.
+The e-paper backend in `crates/ui-eink/src/lib.rs` implements the same `Painter` trait for `DrawTarget<Color = Gray2>`. That equality bound requires a two-bit grayscale destination, not merely a color that can be converted from RGB. The backend supports native grayscale and binary-dither UI modes and records tone information in its paint report. Gray-looking content may therefore be represented by native intermediate tones or by a pattern of black and white, depending on the selected mode.
 
-## An e-ink painter
+Neither implementation alone chooses the panel waveform. Painting changes the destination image; refresh policy decides how the physical display transitions to it. Even a complete repaint need not imply a complete flashing waveform. Controller state, supported update modes, and periodic cleanup also matter. Keeping these decisions separate is essential to understanding why drawing less and refreshing differently are related but not interchangeable optimizations.
 
-E-paper is not an RGB screen. The X4 PRO's panel shows **four grey levels**, and
-a frame's refresh is cheaper and faster if it uses only black and white. So the
-e-ink painter in `crates/ui-eink` implements `Painter` for targets whose colour
-is a 2-bit grey:
+## Try it: follow the missing label
 
-```rust
-impl<D> Painter for EInkPainter<'_, D>
-where
-    D: EgDrawTarget<Color = Gray2>,
-{
-    type Error = D::Error;
-    // ...
-}
-```
+As an optional hardware-free exercise, trace `render_ui` for a frame in which a label becomes shorter. First assume preparation returns damage covering the old and new label. Identify the call that removes the old tail, then the call that draws the replacement. Next follow `EmbeddedGraphicsPainter::clear_damage`: full damage calls the target's native clear operation; partial damage is clipped to target bounds and filled rectangle by rectangle.
 
-`EgDrawTarget<Color = Gray2>` is an **associated type equality constraint**: this
-impl applies only to targets whose `Color` *is* `Gray2`. The e-ink painter
-also tracks which grey levels a frame actually used (`EInkPaintReport`), so the
-firmware can choose a fast black-and-white refresh when nothing grey was drawn.
-That's a direct payoff of painting *operations* instead of pixels.
-
-Colours carry their own conversion to grey:
-
-```rust
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the weights sum to 256, so the quotient is at most 255"
-)]
-pub const fn luminance(self) -> Luminance {
-    // rec. 601 integer luminance
-    // ...
-}
-```
-
-Here's the `#[expect]` pattern from chapter 1 in action. The cast is fine, the
-reason is written down, and if the code ever changes so that the cast no longer
-triggers the lint, `expect` itself warns that the annotation is stale. `#[allow]`
-would stay silent forever.
-
-### Why a separate crate?
-
-On 17 October the e-ink backend left `inkpaper-ui` for its own crate,
-`inkpaper-ui-eink`. The commits just before it moved the shared logic (text and
-image paint pipelines, `draw_box_to`, conversions) into public helpers in
-`inkpaper_ui::backend`, documented as "shared embedded-graphics helpers". After
-that, a backend is just a crate that implements `Painter`, using only the public
-API. If the core's own backends can live outside the core, anyone else's can too:
-a colour LCD, a memory LCD, a test recorder. That's a good test of whether an
-abstraction really is one.
-
-## Rust concepts in this chapter
-
-- **Wrapping an ecosystem trait** (`DrawTarget`) behind a domain trait
-  (`Painter`), and an optional dependency behind a feature.
-- **Associated error types**, `Infallible`, and **generic error wrappers**
-  (`PaintError<E>`).
-- **Trait objects for closures** (`&mut dyn FnMut(...)`).
-- **Bounds on associated types** (`D::Color: From<...>`) and **equality
-  constraints** (`DrawTarget<Color = Gray2>`).
-- **Borrowing a resource for the life of a helper** (`&'target mut D`).
-- **Implementing a trait for `()`** as a zero-cost "nothing" implementation, and
-  **default type parameters** (`RESOURCES = ()`).
-- **Generics vs `dyn`** as a per-call-site trade-off.
-- **`heapless::Vec`** and iterative traversal with a bounded stack.
-- **`#[expect]` versus `#[allow]`**.
-
-## Try it yourself
-
-1. Run `cargo run -p inkpaper-ui --example simulator --features
-   embedded-graphics`, the framework's own feature gallery that grew out of
-   `b6a0814`. Find its source in `crates/ui/examples/`.
-2. Write a `CountingPainter` that implements `Painter` with
-   `type Error = Infallible` and only counts calls per method. Paint a small tree
-   with it in a test. That's a cheap way to assert "this change paints fewer
-   boxes".
-3. Look for `Color = Gray2` in `crates/ui-eink/src`. Try to use `EInkPainter`
-   with an `Rgb888` simulator display and read the compiler error.
+Your observable result is a two-case call trace. If you mentally omit the clear, the new label cannot erase pixels it never touches. If preparation returns no damage, neither clear nor paint runs. This is enough to explain a surprisingly large class of stale-pixel bugs before involving a physical display at all.

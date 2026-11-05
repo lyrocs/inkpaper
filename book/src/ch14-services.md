@@ -1,304 +1,94 @@
-# 14. Services: platforms, requests and replies
+# 14. Slow work without tangled UI state
 
-> **Where we are:** `1a9a532` "add hardware-independent application shell"
-> (19 August 2026), the storage work of late August, the September split into an
-> app service (`182d513` "extract x4 app service", `ce776c6`/`c1c7a78` "move
-> simulator/x4 orchestration into app", `d6cb386` "enforce app service
-> boundary"), persistence formats (`e977ecf` postcard, `58192c4` minicbor), and two
-> refinements: `bd97634` (per-command reply slots, 11 October) and `c2e1e53`
-> (one app request at a time, 5 November).
+Opening a folder begins as a tiny interaction: select a row. Finishing it may require waking storage, reading directory entries, allocating names, and reporting an error if the card is unavailable. A dictionary lookup can take longer still when its index needs preparing. The user should see an understandable transition, not a listener that disappears into filesystem machinery.
 
-## The problem: UI code can't wait
+InkPaper separates expressing an intention from carrying it out. Synchronous UI code records a request. An asynchronous application service removes that request, performs the operation through a platform interface, and briefly re-enters the UI to apply the answer. This keeps the ownership boundary clear. It also gives the application a place to decide which work should happen first—and when work must pause so a status frame can become visible.
 
-The UI runtime is synchronous. `render`, listeners and `update` are plain
-functions that must finish quickly. But a lot of what an e-reader does is slow
-and asynchronous: list a folder on the SD card, open an EPUB, read a chapter,
-save the reading position, scan for WiFi networks.
+## Leave a request, not a suspended listener
 
-Two bad solutions come to mind:
+The browser stores pending work in an `Option<BrowseRequest>`. Its `take_request` uses `self.pending.take()`: ownership of the request moves to the caller, and the slot becomes `None`. A newer pending intention can replace an older one before it is taken. This is appropriate for “show this directory,” where the latest destination often matters more than visiting every intermediate destination. It would not be an appropriate default for an audit log or a sequence of payments.
 
-- Make the UI async. Every listener would become a future, and borrowing
-  entity state across `.await` points would be a nightmare.
-- Let listeners block on I/O. The screen would freeze, and on the device they
-  couldn't block anyway, because the storage task runs on the same executor.
+The application's `AppRequest` enum combines frontlight, network, preferences, dictionary, cover, browser, reader, history, and file-transfer work. It does not collect all pending slots in one sweep. `InkPaperApp::take_request`, in `crates/app/src/app/request.rs`, chooses the first available request using a lazy `Option` chain. This exact tail of that chain shows part of the policy:
 
-InkPaper uses a third design: **the UI records what it wants, and a separate
-async service does it later.**
-
-```text
- tap ──► listener ──► app state: "please list /Books"   (sync, instant)
-                                    │
-           main loop ──► AppService::service_pending()   (async)
-                                    │  take_request()
-                                    ▼
-                          platform.list_directory("/Books").await
-                                    │
-                                    ▼
-             runtime.update(app, |app, cx| app.apply_listing(...))
+```rust,ignore
+.or_else(|| self.lookup.take_request().map(AppRequest::Dictionary))
+.or_else(|| self.cover.take_request().map(AppRequest::Cover))
+.or_else(|| self.browser.take_request().map(AppRequest::Browse))
+.or_else(|| self.reader.take_request().map(AppRequest::Reader))
+.or_else(|| {
+    self.reading_history
+        .take_request()
+        .map(AppRequest::ReadingHistory)
+})
+.or_else(|| {
+    self.file_transfer
+        .take_request()
+        .map(AppRequest::FileTransfer)
+})
 ```
 
-## Requests as data
+`map` wraps a specific request in the larger enum. `or_else` runs its closure only when the preceding result is `None`. Laziness is essential because taking a request changes state. Eagerly evaluating every alternative would empty later slots even when an earlier request wins, losing the work those values represented.
 
-When the user opens a folder, the browser state just stores the wish:
+The complete priority order is frontlight setting, frontlight preferences, clock sync, WiFi join, WiFi scan, saving WiFi networks, saving clock preferences, reader preferences, dictionary, cover, browser, reader, reading history, and file transfer. Reader work precedes history so progress changes reach the service before Home or Recent Books requests a snapshot. These are priorities between pending requests, not preemption: a newly urgent setting does not interrupt an operation already being awaited.
 
-```rust
-pub(crate) fn take_request(&mut self) -> Option<BrowseRequest> {
-    self.pending.take()
-}
+There is another ordering rule outside this chain. `AppService::service_pending` checks the desired reader font before taking an `AppRequest`, because reader work lays out text using that font. “The enum order is the entire scheduler” would therefore be an incomplete reading of the code.
+
+## Borrow briefly, work outside the borrow
+
+The service loop takes one request inside `runtime.update`, then matches it outside that closure. The directory handler awaits `platform.list_directory`, converts successful entries into browser entries, and applies the result in another `runtime.update`. An error instead updates the browser's error state.
+
+This exact success-path excerpt from `crates/app/src/service/mod.rs` begins after the platform call has returned its entries:
+
+```rust,ignore
+let entries = entries
+    .into_iter()
+    .map(PlatformEntry::into_browse_entry)
+    .collect();
+
+let listing = BrowseListing::new(path, entries);
+
+runtime.update(app, move |app, cx| {
+    app.apply_browse_listing(listing, cx);
+})?;
 ```
 
-`pending` is an `Option<BrowseRequest>`, a **slot**. A newer request simply
-replaces an older one (tapping two folders quickly lists only the second). Each
-part of the app has its own slot, and the app collects them into one enum:
+The `move` closure brings the owned listing into the short synchronous update. There is no need to retain a borrowed browser entity across the filesystem await. The service owns the work product until the application accepts it. This is a more useful rule than “never borrow anything across await”: borrowing a bus across a transfer is ordinary async Rust. The boundary to protect here is the UI entity borrow.
 
-```rust
-/// work the app asks the service for
-#[derive(Debug)]
-pub(crate) enum AppRequest {
-    Frontlight(FrontlightSetting),
-    FrontlightPreferences(FrontlightPreferencesRequest),
-    /// sync the clock over the network this plan joins
-    ClockSync(WifiJoinPlan),
-    WifiJoin(WifiCredentials),
-    WifiScan,
-    SaveWifiNetworks(SavedNetworks),
-    SaveClockPreferences(ClockPreferences),
-    ReaderPreferences(ReaderPreferencesRequest),
-    Dictionary(DictionaryRequest),
-    /// load the cover of the book at this path
-    Cover(String),
-    Browse(BrowseRequest),
-    Reader(ReaderRequest),
-    ReadingHistory(ReadingHistoryRequest),
-    FileTransfer(FileTransferRequest),
-}
+The main firmware task awaits `service_pending` before rendering. Consequently, this design does **not** dispatch UI input concurrently throughout a slow directory operation. Other tasks can continue while I/O is pending, including tasks collecting input, but the main loop resumes dispatch afterward. Synchronous computation inside an async operation can also occupy the executor. Separating requests from listeners prevents tangled lifetimes and creates scheduling opportunities; it does not automatically eliminate every source of visible latency.
+
+Making every UI listener a future would expose the entity model to those longer lifetimes. A fully separate worker processing every app request could improve concurrency, but would need explicit stale-result, cancellation, and ordering rules. The current service keeps application-state mutation serialized and makes a smaller, understandable tradeoff.
+
+## Show the waiting state before doing the wait
+
+Dictionary indexing demonstrates a deliberate extra step. On a first lookup, the service may discover that index samples are missing. Rather than immediately doing the long sampling pass, it marks work deferred and asks the app to show that state. This is the exact branch in `crates/app/src/service/dictionary.rs`:
+
+```rust,ignore
+let Some(outcome) = self.look_up(&request, !request.deferred).await else {
+    self.deferred = true;
+
+    runtime.update(app, move |app, cx| {
+        app.apply_dictionary_deferred(request, cx);
+    })?;
+
+    return Ok(());
+};
 ```
 
-The latest commit in the repository (`c2e1e53`) changed how the service collects
-them. Instead of polling fourteen slots one by one, it asks the app for **the next
-request**, and the app decides the priority in one expression:
+The surrounding `service_pending` loop checks `self.deferred` and returns, allowing the frame to be rendered and presented. On the next firmware iteration, `has_deferred_work()` enables an immediately ready wake source. No extra tap is needed to restart the operation. The deferred request then permits the index sampling instead of postponing it again.
 
-```rust
-pub(crate) fn take_request(&mut self, cx: &mut Context<'_, Self>) -> Option<AppRequest> {
-    self.frontlight
-        .update(cx, |frontlight, _| {
-            frontlight
-                .take_request()
-                .map(AppRequest::Frontlight)
-                .or_else(|| {
-                    frontlight
-                        .take_preferences_request()
-                        .map(AppRequest::FrontlightPreferences)
-                })
-        })
-        .or_else(|| self.take_clock_sync_request().map(AppRequest::ClockSync))
-        .or_else(|| self.wifi.take_join_request().map(AppRequest::WifiJoin))
-        .or_else(|| {
-            self.wifi
-                .take_scan_request()
-                .then_some(AppRequest::WifiScan)
-        })
-        // ...
-        .or_else(|| self.browser.take_request().map(AppRequest::Browse))
-        .or_else(|| self.reader.take_request().map(AppRequest::Reader))
-        .or_else(|| {
-            self.reading_history
-                .take_request()
-                .map(AppRequest::ReadingHistory)
-        })
-        // ...
-}
-```
+That distinction is small in code and large in experience. Setting “indexing” in application state is not enough if a long operation immediately follows and no frame can show the new state. Presentation must occur between the announcement and the work. This path provides that ordering; it is not a general progress-streaming mechanism or a guarantee that all long operations show intermediate frames.
 
-This is **`Option` chaining** at its best.
+A different early return protects a resource boundary. After file-transfer service, `service_pending` returns rather than continuing to storage-backed requests. A successful USB Drive transition makes the filesystem unavailable to normal application use. Scheduling here is about valid ownership of storage, not merely making the interface feel quick.
 
-- `.map(AppRequest::Browse)` wraps a `BrowseRequest` into the enum, using the
-  variant as a function again.
-- `.or_else(|| ...)` tries the next source *only if* the previous one returned
-  `None`. It takes a **closure** so the later sources aren't touched at all once
-  one returns `Some`. That matters, because `take_request` *removes* the request
-  from its slot. With `.or(...)` instead, every slot would be emptied on every
-  call and all but the first request would be lost.
-- `bool::then_some(value)` turns `true` into `Some(value)` and `false` into
-  `None`, which suits the WiFi scan, a request with no data.
+## A platform operation becomes a conversation
 
-The order of the chain *is* the priority policy, and the doc comment says why:
-"Reader requests come before history, so a page turn's progress is saved before
-Home and Recent Books take their snapshot."
+`AppPlatform`, in `crates/app/src/service/platform.rs`, describes operations rather than SD-controller details. Its associated `Error` type lets each platform retain its own errors; `RandomAccessSource: EpubSource` supplies the file abstraction that later chapters use for EPUB reading. Its contracts include bounded whole-file reads and support for at least four simultaneously open random-access files.
 
-## The service
+`load_state` returns `Result<Option<Vec<u8>>, Self::Error>`. Missing saved state is `Ok(None)`, bytes are `Ok(Some(...))`, and an operational failure is `Err(...)`. Keeping absence separate from failure lets first boot remain an ordinary condition. Some network operations explicitly start work and report completion later; the word `async` alone does not tell you whether a method awaits the whole operation or only its submission.
 
-`AppService<P>` takes requests one at a time and performs them:
+On the device, storage belongs to a dedicated task. A directory command contains an owned path and a reply slot. The caller waits for that particular slot while the task handles the command. These are exact excerpts from `firmware/x4-pro/src/firmware/rpc.rs`, with its separate `Debug` implementation omitted:
 
-```rust
-loop {
-    let Some(request) = runtime.update(app, |app, cx| app.take_request(cx))? else {
-        return Ok(());
-    };
-
-    match request {
-        AppRequest::Frontlight(setting) => {
-            let _ = self.platform.set_frontlight(setting).await;
-        }
-        AppRequest::WifiScan => {
-            if self.platform.start_wifi_scan().await.is_err() {
-                runtime.update(app, |app, cx| {
-                    app.apply_wifi_scan_result(Err(WifiScanError), cx);
-                })?;
-            }
-        }
-        AppRequest::Browse(request) => {
-            self.service_browse_request(runtime, app, request).await?;
-        }
-        AppRequest::Reader(request) => {
-            self.service_reader_request(runtime, app, request).await?;
-        }
-        AppRequest::FileTransfer(request) => {
-            self.service_file_transfer_request(runtime, app, request)
-                .await?;
-
-            // A successful USB Drive transition makes the filesystem unavailable.
-            // Do not loop around and try to service another storage-backed request.
-            return Ok(());
-        }
-        // ...
-    }
-}
-```
-
-The pattern is: borrow the app briefly to take a request (sync), release it,
-`.await` the platform (async), then borrow the app briefly again to apply the
-result (sync). **No entity borrow is ever held across an `.await`.** That's the
-rule that makes sync UI and async I/O coexist. If a borrow were held across an
-await, any input event processed while waiting would hit a `BorrowConflict`.
-
-The `match` is **exhaustive**. Adding a new `AppRequest` variant breaks the build
-until the service handles it, so a request can't be silently ignored.
-
-## The platform trait
-
-What does "list a directory" mean? On the device, it's a FAT32 filesystem on an
-SD card, accessed by another task. In the simulator, it's a folder on your
-laptop. The app abstracts that behind a trait:
-
-```rust
-#[allow(async_fn_in_trait)]
-pub trait AppPlatform {
-    type Error;
-    type RandomAccessSource: EpubSource;
-
-    async fn list_directory(&mut self, path: &str) -> Result<Vec<PlatformEntry>, Self::Error>;
-
-    /// Opens `path` to read anywhere in it. At least four files stay open
-    /// together, a book and a dictionary's; opening more may close the one
-    /// read least recently.
-    async fn open_random_access(
-        &mut self,
-        path: &str,
-    ) -> Result<Self::RandomAccessSource, Self::Error>;
-
-    /// Reads the whole file at `path`, refusing one over `max_bytes`.
-    async fn read_file(&mut self, path: &str, max_bytes: usize) -> Result<Vec<u8>, Self::Error>;
-
-    async fn load_state(
-        &mut self,
-        name: &str,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
-
-    async fn save_state(&mut self, name: &str, bytes: &[u8]) -> Result<(), Self::Error>;
-
-    /// Bytes unique to this device, used to obfuscate saved WiFi passwords.
-    fn device_key(&self) -> DeviceKey;
-
-    /// Starts a WiFi scan and returns without waiting. The platform reports the
-    /// networks through [`InkPaperApp::apply_wifi_scan_result`].
-    async fn start_wifi_scan(&mut self) -> Result<(), Self::Error>;
-    // ...
-}
-```
-
-Two **associated types**:
-
-- `type Error`: the simulator uses `std::io::Error`, the device uses its own
-  `StorageError`.
-- `type RandomAccessSource: EpubSource`: an opened file that the EPUB parser
-  (chapter 15) can read at arbitrary offsets. The bound says "whatever type you
-  return, the EPUB parser must be able to read it". That connects the platform
-  to the parser without either knowing the other's concrete types.
-
-The documentation carries **contracts** that the type system can't express:
-"at least four files stay open together", "refusing one over `max_bytes`",
-"returns without waiting". Every implementation must honour them, and the doc
-comment is where they're written down.
-
-Look at `load_state`'s return type: `Result<Option<Vec<u8>>, Self::Error>`. The
-three layers mean three different outcomes: an error (the card failed), `Ok(None)`
-(nothing saved yet, a normal first boot) and `Ok(Some(bytes))`. Collapsing
-"missing" into an error would force callers to inspect error kinds to tell a
-first boot from a broken card.
-
-The simulator implementation is short, ordinary `std` code:
-
-```rust
-impl AppPlatform for SimulatorPlatform {
-    type Error = io::Error;
-    type RandomAccessSource = HostFileSource;
-
-    async fn read_file(&mut self, path: &str, max_bytes: usize) -> Result<Vec<u8>, Self::Error> {
-        let host_path = card_folder_path(path).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "simulated file does not exist")
-        })?;
-
-        if fs::metadata(&host_path)?.len() > max_bytes as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "file is too large"));
-        }
-
-        fs::read(host_path)
-    }
-    // ...
-}
-```
-
-These `async fn`s never actually wait, and the simulator drives them with
-`futures_lite::future::block_on`. An `async fn` doesn't *have* to await anything,
-which is what makes one trait serve both a blocking desktop and an async
-microcontroller.
-
-## On the device: request/reply over channels
-
-On the X4, the filesystem lives in the **storage task** (it also hands the SD card
-to USB mass storage when you plug in a cable). The main task can't touch it
-directly, so it sends commands. Each command carries its own **reply slot**:
-
-```rust
-#[derive(Debug)]
-enum Command {
-    ListDirectory {
-        path: String,
-        reply: Reply<Result<Vec<StorageEntry>, StorageError>>,
-    },
-    ReadFile {
-        path: String,
-        max_bytes: usize,
-        reply: Reply<Result<Vec<u8>, StorageError>>,
-    },
-    SaveState {
-        name: String,
-        bytes: Vec<u8>,
-        reply: Reply<Result<(), StorageError>>,
-    },
-    EnterUsbDrive(Reply<bool>),
-    Shutdown(Reply<()>),
-    // ...
-}
-```
-
-The `Reply<T>` type and the generic `call` helper fit in 30 lines
-(`firmware/x4-pro/src/firmware/rpc.rs`):
-
-```rust
-/// The one-shot reply slot a command carries back to its caller.
+```rust,ignore
 pub(crate) struct Reply<T>(Arc<Signal<CriticalSectionRawMutex, T>>);
 
 impl<T: Send> Reply<T> {
@@ -306,8 +96,9 @@ impl<T: Send> Reply<T> {
         self.0.signal(value);
     }
 }
+```
 
-/// Sends the command `command` builds around a fresh reply and waits for the answer.
+```rust,ignore
 pub(crate) async fn call<C, T: Send, const N: usize>(
     commands: &Channel<CriticalSectionRawMutex, C, N>,
     command: impl FnOnce(Reply<T>) -> C,
@@ -318,172 +109,12 @@ pub(crate) async fn call<C, T: Send, const N: usize>(
 }
 ```
 
-This is a tiny **RPC** (remote procedure call) system.
+The command channel queues requests and applies backpressure when full. Each call's signal holds its answer. Unlike the battery signal shared between updates, this signal is newly allocated for one call. The `Arc` gives caller and command shared ownership of that slot; the last owner releases its allocation. `send(self, ...)` consumes the reply handle, preventing a second send through that same handle. `FnOnce` lets a command-building closure move its captured path into the command.
 
-- `Arc<Signal<...>>`: an atomically reference-counted, heap-allocated signal,
-  shared by the caller (who waits on it) and the command (which carries it to the
-  storage task). When both sides are done, the last `Arc` frees it.
-- `Reply::send(self, ...)` takes `self` **by value**. A reply can be sent only
-  once, because sending consumes it. The type system enforces the "one-shot"
-  in the doc comment.
-- `command: impl FnOnce(Reply<T>) -> C` lets the caller build the command
-  *around* the reply. And because enum variants are functions, the simplest calls
-  read almost like magic:
+This ties answers to callers even when calls overlap. It does not add a timeout or propagate caller cancellation into storage. If a caller disappears after enqueueing, the storage operation can still run and send to its now-unobserved slot. If a command never produces an answer, `call` can wait indefinitely. A useful abstraction states its limits as clearly as its convenience.
 
-```rust
-pub async fn shutdown_and_wait() {
-    rpc::call(&COMMANDS, Command::Shutdown).await;
-}
+## Try it: trace an indexing handoff
 
-pub async fn enter_usb_drive_and_wait() -> bool {
-    rpc::call(&COMMANDS, Command::EnterUsbDrive).await
-}
-```
+For a hardware-free experiment, read `service_dictionary_request` in `crates/app/src/service/dictionary.rs`, its caller in `service/mod.rs`, and `deferred_work` in `firmware/x4-pro/src/firmware/mod.rs`. Assume a dictionary opens successfully, has no samples, and the first request is not deferred.
 
-`Command::Shutdown` has type `fn(Reply<()>) -> Command`, which is exactly an
-`FnOnce(Reply<T>) -> C` with `T = ()`. **Type inference** works out `T` from the
-variant, and the return type of `call` follows. Richer commands use a closure:
-
-```rust
-pub async fn list_directory_and_wait(path: &str) -> Result<Vec<StorageEntry>, StorageError> {
-    rpc::call(&COMMANDS, |reply| Command::ListDirectory {
-        path: String::from(path),
-        reply,
-    })
-    .await
-}
-```
-
-`reply,` in the struct literal is **field init shorthand** for `reply: reply`.
-
-Before `bd97634` the firmware used one shared signal per *kind* of reply, which
-was fragile if two callers overlapped. Putting the reply *inside* the command
-ties each answer to its question.
-
-### The other end
-
-The storage task is a loop over commands:
-
-```rust
-loop {
-    match COMMANDS.receive().await {
-        Command::ListDirectory { path, reply } => {
-            reply.send(list_directory(filesystem, &path).await);
-        }
-
-        Command::ReadRandomAccess { handle, offset, len, reply } => {
-            let index = open_random_access
-                .iter()
-                .position(|file| file.handle().id() == handle);
-
-            let result = match index {
-                Some(index) => {
-                    let result = open_random_access[index].read_exact_at(offset, len).await;
-
-                    // most recently read last
-                    open_random_access[index..].rotate_left(1);
-
-                    result
-                }
-                None => Err(StorageError::StaleHandle),
-            };
-
-            reply.send(result);
-        }
-        // ...
-    }
-}
-```
-
-Destructuring the command in the `match` arm moves `path` and `reply` out of it.
-The open-file list is a tiny **LRU cache** (least recently used): `rotate_left(1)`
-on the tail of a slice moves the file just read to the end, and when the list is
-full, `remove(0)` closes the least recently used file. It's four files, so a
-`Vec` and a linear scan beat any clever data structure.
-
-The firmware's `X4Platform` implements `AppPlatform` by calling these functions,
-and the app never learns there's another task involved.
-
-## Saving state: formats that survive upgrades
-
-Preferences and reading progress are saved as small files. The first format was
-`postcard` (`e977ecf`), a compact serde-based binary format. It encodes fields
-**by position**, so adding a field changes the layout, and old files can't be
-read anymore. Commit `58192c4` switched to **minicbor with indexed fields**:
-
-```rust
-#[derive(Debug, Encode, Decode)]
-struct StoredReaderPreferences {
-    #[n(0)]
-    font_size: u16,
-    #[n(1)]
-    line_spacing: u8,
-    #[n(2)]
-    margin: u8,
-    // ...
-    /// on when missing, from before the setting existed
-    #[n(7)]
-    hyphenation: Option<bool>,
-    /// the card family's name; the built-in font when missing
-    #[n(8)]
-    font: Option<String>,
-    /// normal when missing, from before the setting existed
-    #[n(10)]
-    darkness: Option<u8>,
-    /// off when missing, from before the setting existed
-    #[n(11)]
-    antialiasing: Option<bool>,
-}
-```
-
-Each field has a **stable number** (`#[n(7)]`), like Protocol Buffers. New fields
-get new numbers and are `Option`, so a file written by an older firmware (which
-lacks field 11) still decodes, with `None` meaning "use the default". The
-comments record what each `None` means. **Derive macros** (`Encode`, `Decode`)
-generate all the serialisation code from these annotations.
-
-Loading stays forgiving:
-
-```rust
-pub(super) async fn load_history(&mut self) -> ReadingHistory {
-    self.read_state(READING_HISTORY_STATE, MAX_READING_HISTORY_BYTES)
-        .await
-        .and_then(|bytes| ReadingHistory::decode(&bytes).ok())
-        .unwrap_or_default()
-}
-```
-
-`.ok()` turns a `Result` into an `Option`, discarding the error. Then
-`.and_then(...)` chains a second fallible step, and `.unwrap_or_default()` falls
-back to `ReadingHistory::default()`. A corrupted history file must never stop the
-reader from booting, and this one expression encodes that policy.
-
-Every read has a size cap (`MAX_READING_HISTORY_BYTES = 64 * 1024`), so a
-corrupted or hostile file can't make the device allocate unbounded memory.
-
-## Rust concepts in this chapter
-
-- **Separating sync UI from async I/O** with request slots and a service loop.
-- **Never holding a borrow across `.await`.**
-- **`Option` chaining**: `map`, `or_else` (lazy) vs `or` (eager), `then_some`,
-  `ok`, `and_then`, `unwrap_or_default`.
-- **Exhaustive `match`** as a completeness check.
-- **Traits with associated types bounded by other traits**
-  (`RandomAccessSource: EpubSource`), and documented contracts.
-- **`Result<Option<T>, E>`** for three distinct outcomes.
-- **`Arc`**, one-shot types via `self`-consuming methods, RPC over channels.
-- **Enum variants as `FnOnce`**, type inference through generic helpers, field
-  init shorthand.
-- **`slice::rotate_left`**, tiny LRU caches.
-- **Derive macros for serialisation**; stable field numbers for forward
-  compatibility.
-
-## Try it yourself
-
-1. Swap one `.or_else(|| ...)` in `take_request` for `.or(...)` and write a test
-   that queues two requests from different slots. What goes wrong?
-2. Write a `MemoryPlatform` for tests that stores `save_state` calls in a
-   `HashMap` and returns them from `load_state`. Which associated types does it
-   need?
-3. Encode a `StoredReaderPreferences` with minicbor, then decode it into a copy of
-   the struct that lacks field `#[n(11)]`. Then try the opposite direction.
+Write a five-step trace: missing samples discovered; request and service marked deferred; service returns; status frame is presented; deferred wake resumes work. On that second pass, `may_defer` is false and `sample_index().await` is reached. The observable result is a verified ordering in the current control flow: indexing cannot consume that second pass before the intervening presentation completes. No commands or hardware are required. This does not predict how long indexing or the panel will take; it explains why the waiting message gets a chance to exist on screen first.

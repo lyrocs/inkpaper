@@ -1,168 +1,75 @@
-# 1. The project, the workspace and the toolbox
+# 1. A page on your desk: the workspace
 
-> **Where we are:** the whole repository, as it stands today. Before following the
-> history, we take a tour of the finished building so we know where each room is.
+An e-reader earns its place by getting out of the way. Tap a book, see a page, turn it, keep reading. Yet that apparently quiet experience asks software to do several quite different jobs: understand a document, find sensible line breaks, draw letters, interpret a finger, and persuade a physical display to change. InkPaper lets us explore those jobs without starting with a circuit board.
 
-## The hardware we are writing for
+The quickest useful destination is a working window, not a diagram of every crate. From the repository root, this is the simulator command documented in the README:
 
-The XTEINK X4 PRO is a pocket e-reader. For a programmer, what matters is this:
+```sh
+cargo run -p inkpaper-simulator
+```
 
-- an **ESP32-S3** microcontroller: two Xtensa cores at 240 MHz, about 512 KB of
-  internal RAM, plus a few megabytes of slower external PSRAM;
-- an **800×480 e-paper panel** that we hold in portrait as 480×800. It can show
-  four grey levels and takes hundreds of milliseconds to refresh;
-- a **GT911** capacitive touch controller, a **CW2017** battery gauge and a
-  **BM8563** real-time clock, all on one I²C bus;
-- two side buttons, a power button, a two-channel frontlight, an SD card slot and
-  USB.
+The desktop backend uses `embedded-graphics-simulator`; its [installation instructions](https://crates.io/crates/embedded-graphics-simulator) cover the native SDL prerequisites. Those are desktop dependencies, not the ESP32 toolchain. Once they are available, the command builds and launches the application in a portrait window.
 
-Compared with a laptop, memory is small, the display is slow and there is no
-operating system. These three facts explain most of the design decisions in this
-book.
+Use the mouse's left button as a finger. Open the file browser and choose `/Fixtures`, whose entries come from real EPUB files in this repository. The plausible-looking titles elsewhere in the browser are illustrative listings, not bundled novels. In a book, the right and left arrow keys send Next and Previous; `H` sends Home. Getting a page on screen is our first win. The rest of this chapter explains what you have just exercised—and what a desktop window cannot tell you.
 
-## The README's three goals
+## One picture, several kinds of work
 
-The README states the project's goals:
+The simulator presents a 480-by-800 drawing surface. A page is not sent to that surface as an EPUB, a paragraph, or even a string. It becomes pixels. Keeping those representations separate makes the implementation understandable.
 
-> - keep hardware-specific code separate from application logic
-> - keep the core firmware compatible with `no_std`
-> - make device independent code testable on a host machine
+The document side starts with the EPUB's content and styling. The reader measures text and divides it into lines and pages. Measurement needs font information: letters have different widths, and adjacent characters can affect which glyphs are used and where they sit. A *glyph* is a drawable form from a font, not necessarily one character. InkPaper's reader measurer uses the UI text shaper to obtain advances—the distances needed to place text—before pagination commits to a line width.
 
-Keep them in mind. Most of the structure we are about to see exists to serve them.
+Painting then works from a laid-out page. In `crates/app/src/reader_page.rs`, `paint_page` visits text and image fragments. Text fragments become styled text runs at known bounds; images become image draw operations. Around the page, the application's menus and labels use an element tree that the UI lays out. The two routes meet at painting, without pretending a book page must be thousands of tiny menu widgets.
 
-## A Cargo workspace
+The screen adds another separation. A desktop window can display the resulting pixels promptly. An e-paper panel must physically change its image, and updating it has costs that are not captured by a fast host render. That is why knowing *what changed* matters. Repainting the entire interface whenever the battery is sampled would be convenient software and an unnecessarily restless reading experience.
 
-InkPaper is not one crate but about twenty-five. They live in one **Cargo
-workspace**, described by the `Cargo.toml` at the root:
+Here is an exact fragment from the simulator's `render_ui` in `crates/sim/src/render.rs`:
+
+```rust,ignore
+let damage = runtime
+    .prepare_frame(DISPLAY_SIZE)
+    .expect("UI rebuild failed");
+if damage.is_none() {
+    return;
+}
+
+let mut painter = EmbeddedGraphicsPainter::new(display)
+    .with_coverage_mode(CoverageMode::alpha_blend(read_simulator_pixel));
+
+painter.clear_damage(damage, Color::WHITE).unwrap();
+```
+
+This is a function-body excerpt, not a standalone program. `prepare_frame` prepares the UI and returns its damage: the area needing attention. No damage means no painting here. Otherwise the simulator creates a painter, clears the damaged area, and subsequently calls `paint_with_damage`. Notice the order: decide what needs work, then draw it. Later chapters will make that decision precise.
+
+The simulator is therefore useful for application behavior, layout, and text appearance. It is not a measurement of panel refresh latency, battery use, or device memory pressure. Sharing code gives us a valuable testing surface, not a claim that two machines are equivalent.
+
+## The boundary that makes the window possible
+
+A Rust *crate* is a compilation unit with a public interface. Cargo packages describe those units and their dependencies. InkPaper's workspace collects related packages so they can share dependencies and be developed together. This exact root `Cargo.toml` excerpt is enough of the map for now:
 
 ```toml
 [workspace]
 resolver = "3"
 members = ["crates/*", "firmware/*", "tools/*"]
 default-members = ["crates/*"]
-
-[workspace.dependencies]
-critical-section = "1.2.0"
-defmt = "1.1.1"
-embedded-graphics = "0.8.2"
-embedded-hal = "1.0.0"
-embedded-hal-async = "1.0.0"
-esp-hal = "1.2.1"
-heapless = "0.9.3"
-# ...
-
-[profile.firmware]
-inherits = "release"
-debug = 2
-lto = "fat"
-codegen-units = 1
 ```
 
-A few things to notice.
+The `members` patterns include reusable crates, the firmware, and tools. `default-members` narrows the packages selected by root commands that do not explicitly choose a package. Our launch command uses `-p` because we want one particular program. A workspace is not one giant executable, and choosing a package is not choosing a hardware target.
 
-**`members` uses globs.** Every folder under `crates/`, `firmware/` and `tools/`
-is a package of the workspace. Adding a crate is a matter of creating a folder.
+The important architectural boundary is between application decisions and platform work. `inkpaper-app` depends on the UI, reader, EPUB, dictionary, and tracing crates; its dependency list does not include SDL or the ESP32 hardware abstraction layer. The simulator supplies desktop services. The firmware supplies device services. Both can create `InkPaperApp` because the application does not need to know which display transport or filesystem implements those services.
 
-**`default-members` is narrower than `members`.** When you run `cargo test` or
-`cargo build` at the root without `-p`, Cargo only touches `crates/*`. That
-matters because `firmware/x4-pro` only makes sense for the Xtensa target, and
-`tools/xtask` pulls in heavy desktop dependencies. Day-to-day commands stay fast
-and work on any machine.
+This is a practical use of crate boundaries. Code cannot casually import an undeclared driver dependency. That does not make poor architecture impossible—someone could add the dependency—but it makes crossing the boundary an explicit change rather than an accidental call buried inside a screen.
 
-**`[workspace.dependencies]` pins versions in one place.** A member crate
-then writes:
+Compare this with a single executable whose screen code opens files and touches peripherals directly. That can be pleasantly simple at first. It also makes every screen test a platform test. Here, the extra boundary buys a short feedback loop: much of the reader can be exercised on the desk while the device integration remains a separate concern.
 
-```toml
-[dependencies]
-heapless = { workspace = true }
-defmt = { workspace = true, optional = true }
-```
+## Small Rust does not mean no heap
 
-Every crate that uses `heapless` gets the same version, and upgrading means
-editing one line.
+The UI library declares `#![no_std]`. That means it does not automatically link Rust's `std` library or use its prelude. It does **not** mean “no memory allocation,” “no operating system can run this,” or “all data must be on the stack.”
 
-**`resolver = "3"`** selects the newest feature resolver. You can ignore it for
-now. It mostly changes how features are unified between build-dependencies and
-normal ones, and how `rust-version` is respected.
+Rust's `core` provides language-level building blocks such as slices, iterators, `Option`, `Result`, formatting traits, and pointer operations. The separate `alloc` library provides owned heap-backed structures such as `Vec`, `String`, and `Box`, provided the final program supplies an allocator. `std` adds facilities such as files and threads, alongside re-exporting much of that common machinery. A desktop executable using `std` can happily depend on a `no_std` library.
 
-**Custom profiles.** `[profile.firmware]` *inherits* from `release` and turns on
-fat link-time optimisation and a single codegen unit. That makes compilation
-slower and the binary smaller and faster, which matters on a microcontroller.
-`debug = 2` keeps full debug info. It doesn't end up on the device, but
-`probe-rs` uses it to print readable stack traces. You select a profile with
-`--profile firmware`.
+These exact, adjacent declarations in `crates/ui/src/lib.rs` show the distinction:
 
-## The crates and their layers
-
-Here is the map, from the bottom up.
-
-| Layer | Crates | `no_std`? |
-|-------|--------|-----------|
-| Chip drivers | `cw2017`, `bm8563`, `gt911`, `ssd1677`, `uc8179`, `uc8279-x4`, `frontlight`, `sntp`, `epd-bus`, `xteink-display-probe` | yes |
-| UI framework | `ui` (`inkpaper-ui`), `ui-eink`, `ui-macros`, `ui-style-schema` | yes (macros run on the host) |
-| Documents | `epub`, `reader`, `dictionary` | yes, with `alloc` |
-| Application | `app` (`inkpaper-app`) | yes, with `alloc` |
-| Diagnostics | `trace`, `trace-macros` | yes |
-| Platforms | `sim` (desktop), `firmware/x4-pro` (device) | sim: no, firmware: yes |
-| Tooling | `tools/xtask` | no |
-
-The important arrow is that **`app` depends on `ui`, `epub`, `reader` and
-`dictionary`, but not on any driver.** Only the two *platform* crates, the
-simulator and the firmware, know about real hardware or about SDL windows. Both
-of them create the same `InkPaperApp` and feed it the same input events. That is
-how the README's first and third goals are met: the app is tested and run on a
-laptop, and the firmware is a thin layer that wires real chips to it.
-
-You can check this yourself. Open `crates/app/Cargo.toml`:
-
-```toml
-[dependencies]
-inkpaper-dictionary = { path = "../dictionary" }
-inkpaper-epub = { path = "../epub" }
-inkpaper-reader = { path = "../reader" }
-inkpaper-trace = { path = "../trace" }
-inkpaper-ui = { path = "../ui", features = ["alloc"] }
-minicbor = { version = "2.3.0", default-features = false, features = ["alloc", "derive"] }
-```
-
-No `esp-hal`, no `embedded-hal`, no SDL. Rust's crate graph enforces the
-architecture. If someone tries to call a driver from the app, the code fails to
-compile, so nobody has to catch it in review.
-
-## `no_std`: Rust without an operating system
-
-Almost every library crate starts with this line:
-
-```rust
-#![no_std]
-```
-
-That attribute tells the compiler not to link the **standard library**, `std`.
-`std` assumes an operating system: files, threads, a heap, a clock, sockets. On the
-ESP32-S3 there is none of that. What remains are two smaller libraries:
-
-- **`core`**: always available. Contains `Option`, `Result`, iterators, slices,
-  `str`, `char`, `fmt`, `cell`, `mem`, `ptr`, integer and float types, traits like
-  `Clone`, `Iterator` and `Add`. No allocation, no I/O.
-- **`alloc`**: available if you provide a global allocator. Contains `Vec`,
-  `String`, `Box`, `Rc`, `Arc`, `BTreeMap`, `Cow`.
-
-A crate that needs heap collections opts into `alloc` explicitly:
-
-```rust
-#![no_std]
-
-extern crate alloc;
-
-use alloc::vec::Vec;
-```
-
-That is exactly how `crates/epub/src/lib.rs` begins. The UI crate is more
-careful. It only pulls in `alloc` when asked to:
-
-```rust
-#![no_std]
-
+```rust,ignore
 #[cfg(test)]
 extern crate std;
 
@@ -170,198 +77,14 @@ extern crate std;
 extern crate alloc;
 ```
 
-Read those `#[cfg(...)]` attributes as *conditional compilation*. The line below
-the attribute exists only when the condition holds. In tests, the crate links
-`std` so the test harness can print and allocate. In normal builds it links
-`alloc` only if the `alloc` or `hinting` feature is on. This is how
-`inkpaper-ui` can promise to run "without heap allocation" and still offer
-convenient heap-backed storage to those who want it.
+An attribute beginning with `cfg` conditionally includes the following item. Unit tests can use `std`; the listed conditions make `alloc` available. The UI's `alloc` feature exposes conveniences including heap storage and owned text. Its hinting support also needs allocation facilities. Meanwhile, the application explicitly enables the UI's `alloc` feature and uses heap-backed document data. “The UI can run without a heap” is a capability of the framework, not a description of the entire reader application.
 
-## Features: optional pieces of a crate
+There is a second choice beyond features. Each `Runtime<S>` selects storage through its type parameter `S`: fixed-capacity tables, or heap-backed tables when available. Enabling `alloc` does not force every runtime to use heap tables. A fixed table can coexist with heap-using application code; it bounds that table, not everything the application owns. We will inspect this distinction closely in chapter 4.
 
-**Features** are named switches declared in a crate's `Cargo.toml`. Here is the
-UI crate's list:
+Cargo features are generally additive within a resolved dependency graph. A dependency can enable a feature even if the top-level package does not. In particular, disabling the simulator's default feature selects its fixed runtime configuration, but does not magically remove allocation from its application dependency. Following the dependency edges is more reliable than inferring memory behavior from one command-line switch.
 
-```toml
-[features]
-default = ["ttf", "variable-fonts", "macros"]
-alloc = []
-macros = ["dep:inkpaper-ui-macros"]
-defmt = ["dep:defmt", "heapless/defmt"]
-embedded-graphics = ["dep:embedded-graphics", "embedded-graphics/defmt"]
-ttf = ["dep:ttf-parser"]
-variable-fonts = ["ttf", "ttf-parser/variable-fonts"]
-hinting = ["ttf", "dep:skrifa", "dep:spin"]
-metrics = []
-```
+## Try it: follow the first visible frame
 
-There are three kinds of entries here:
+Optional, after reading: launch the simulator with the command above, enter `/Fixtures`, and open an EPUB. The observable result should be actual book content, not just a filename. Turn a page with the right arrow, then press `H` to return home.
 
-- `alloc = []` is a pure flag. It turns on no dependency, and code tests it
-  with `#[cfg(feature = "alloc")]`.
-- `ttf = ["dep:ttf-parser"]` turns on an **optional dependency**. The `dep:`
-  prefix means "the dependency called `ttf-parser`", as opposed to a feature
-  of that name.
-- `defmt = ["dep:defmt", "heapless/defmt"]` also turns on a feature *in another
-  crate*, so that `heapless` types can be logged with `defmt` too.
-
-Features are **additive**: if two crates in the build graph enable different
-features of `inkpaper-ui`, Cargo builds it once with the union of both. So a
-feature must never *remove* functionality, and code behind
-`#[cfg(not(feature = "x"))]` has to keep working when someone else turns `x` on.
-The `justfile` checks this explicitly:
-
-```make
-ui-features:
-    cargo check -p inkpaper-ui --lib --no-default-features
-    cargo check -p inkpaper-ui --lib --no-default-features --features embedded-graphics
-    cargo check -p inkpaper-ui --lib --no-default-features --features alloc,metrics
-    cargo check -p inkpaper-ui --tests --examples --benches --no-default-features
-    cargo check -p inkpaper-ui --tests --examples --benches --all-features
-```
-
-This habit is worth copying. A feature combination nobody compiles will
-eventually stop compiling.
-
-## Two targets, one source tree
-
-The firmware's `main.rs` is only fourteen lines:
-
-```rust
-#![cfg_attr(target_arch = "xtensa", no_std)]
-#![cfg_attr(target_arch = "xtensa", no_main)]
-
-#[cfg(target_arch = "xtensa")]
-extern crate alloc;
-
-#[cfg(target_arch = "xtensa")]
-mod firmware;
-
-#[cfg(not(target_arch = "xtensa"))]
-fn main() {}
-```
-
-`cfg_attr(condition, attribute)` applies `attribute` only if `condition` holds.
-On the Xtensa target the crate is `no_std` and `no_main`. There is no ordinary
-`main` because the hardware abstraction layer provides the real entry point.
-On any other target, such as your laptop when you run `cargo check
---workspace`, the crate compiles to an empty program. This trick keeps
-workspace-wide commands like `cargo clippy --workspace` from failing on a
-machine without the Xtensa toolchain.
-
-## Toolchains
-
-Xtensa is not an official Rust target yet, so it needs a forked compiler. The
-`setup-toolchain.sh` script installs one with `espup` under a custom name:
-
-```bash
-TOOLCHAIN="inkpaper-esp"
-VERSION="1.97.0.0"
-
-espup install \
-    --name "${TOOLCHAIN}" \
-    --toolchain-version "${VERSION}" \
-    --targets esp32s3
-```
-
-You then choose it per command with `cargo +inkpaper-esp ...`. Your normal
-stable toolchain keeps building everything else.
-
-The repository's `.cargo/config.toml` holds the target-specific settings:
-
-```toml
-[target.xtensa-esp32s3-none-elf]
-runner = ["probe-rs", "run", "--chip=esp32s3", "--preverify", ...]
-
-rustflags = [
-    "-C", "link-arg=-nostartfiles",
-    "-C", "link-arg=-Wl,-Tlinkall.x",
-    "-C", "link-arg=-Tdefmt.x"
-]
-
-[alias]
-xtask = "run -p xtask --"
-
-[unstable]
-build-std = ["core", "alloc"]
-```
-
-- The **runner** makes `cargo run` flash the chip and stream logs back over the
-  debug probe instead of executing a local binary.
-- The **rustflags** pass linker scripts that place code and data in the right
-  memory regions of the chip.
-- **`build-std`** asks Cargo to compile `core` and `alloc` from source for the
-  target, because no precompiled versions exist for it.
-- The **alias** turns `cargo xtask fixtures` into `cargo run -p xtask --
-  fixtures`. This is the "xtask" pattern: project automation written in Rust
-  instead of shell scripts. We meet it again in chapter 20.
-
-## The `justfile`
-
-[`just`](https://github.com/casey/just) is a command runner. The project's
-`justfile` gives names to long commands:
-
-```make
-test: ui-features
-    cargo nextest run
-    cargo nextest run -p inkpaper-ui --all-features
-    # without alloc, the unit tests run against fixed storage
-    cargo nextest run -p inkpaper-ui
-
-sim:
-    cargo run -p {{simulator_package}}
-
-x4-run:
-    cargo +inkpaper-esp run -p {{firmware_package}} --target {{x4_pro_target}} --profile firmware
-```
-
-Look at `test`. The UI crate's tests run twice, once with all features and once
-without. The comment explains why: without `alloc`, the internal type
-`TestStorage` resolves to fixed-capacity storage, so the same tests exercise both
-storage backends. We will see this switch in chapter 4.
-
-## Edition 2024 and lints
-
-Every crate declares `edition = "2024"`. Editions let Rust make small
-backwards-incompatible changes without splitting the ecosystem. Crates on
-different editions link together fine. Edition 2024 brings, among other things,
-`let` chains (`if let Some(x) = a && x > 3 { ... }`), which InkPaper uses, and
-stricter rules for `unsafe` blocks inside `unsafe fn`.
-
-The UI crate also turns on some extra Clippy lints:
-
-```toml
-[lints.clippy]
-# casts that silently change a value. Convert with `try_from`, round floats through
-# `float`, or `#[expect]` the lint with the reason the value fits
-cast_possible_truncation = "warn"
-cast_sign_loss = "warn"
-cast_possible_wrap = "warn"
-```
-
-In Rust, `x as u8` never fails. If `x` is 300, you silently get 44. In a layout
-engine full of pixel arithmetic, that kind of bug is miserable to track down.
-These lints flag every such cast, and the codebase answers each one in one of
-two ways. It uses `u8::try_from(x)`, which returns a `Result`, or it adds an
-explicit `#[expect(clippy::cast_possible_truncation, reason = "16 samples")]`
-that documents why the cast is safe. You will see both patterns again.
-
-## Rust concepts in this chapter
-
-- **Workspaces**: `members`, `default-members`, `[workspace.dependencies]`,
-  custom profiles with `inherits`.
-- **`no_std`**: the split between `core`, `alloc` and `std`, and `extern crate`.
-- **Conditional compilation**: `#[cfg(...)]`, `#[cfg_attr(...)]`, `target_arch`.
-- **Features**: flags, optional dependencies with `dep:`, enabling features of
-  dependencies, additivity.
-- **Toolchains and targets**: `cargo +toolchain`, `build-std`, runners, aliases.
-- **Lints**: `[lints.clippy]`, `#[expect(lint, reason = "...")]`.
-
-## Try it yourself
-
-1. Run `cargo tree -p inkpaper-app --depth 1` and confirm that no driver crate
-   appears.
-2. Run `cargo check -p inkpaper-ui --no-default-features`. Then open
-   `crates/ui/src/lib.rs` and find two items that disappear in that build.
-3. In a scratch crate, write `let x: i32 = 300; let y = x as u8;` and print `y`.
-   Then add `#![warn(clippy::cast_possible_truncation)]` and run `cargo clippy`.
+If SDL is unavailable, take a read-only route instead. Open `crates/sim/src/main.rs` at `main`: follow `new_runtime`, `register_resources`, `create_root`, and the first `render_ui` call. Then read `render_ui` in `crates/sim/src/render.rs`. You should be able to point to three distinct moments: application state is created, a frame is prepared, and damaged pixels are painted. Neither route requires hardware. That distinction between state, representation, and output will carry the next several chapters.

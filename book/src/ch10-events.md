@@ -1,24 +1,47 @@
-# 10. Interaction and typed events
+# 10. From a finger to an intention
 
-> **Where we are:** `12b6e4e` ("add pointer hit testing and click dispatch",
-> 9 August 2026), the typed event work of 13 August (`e388090` → `dc63d2b`), the
-> app taking over input policy (`8f4372f`, 26 August), the removal of focus
-> navigation (`75dc5fe`, 26 September), long presses (`f5c8a1a`, 27 September)
-> and finally typed events between entities (`93f403e`, 5 November).
+You touch the drawer's close button, hesitate, slide away, and lift your finger. The drawer should remain open. If you instead press and release over the same control, it should close. If a long press opens something else, lifting your finger should not also perform an ordinary tap.
 
-## From a tap to a listener
+Those expectations sound simple because the interface hides several decisions. A device reports samples. Gesture logic interprets movement and time. The UI runtime finds an eligible element and manages its pressed state. A listener turns activation into an application intention, and the owner of that state decides what to change.
 
-The device reports "a finger touched the screen at (212, 640)". Somewhere in the
-UI, a `div` with `.on_activate(listener)` should react. Getting from one to the
-other takes three steps:
+InkPaper keeps these layers distinct. That lets a desktop mouse and a touch controller share interaction policy without requiring the UI framework to know what closing a reader drawer means. This session follows that path through current source excerpts; none of the excerpts is a standalone program.
 
-1. **Hit testing**: which node is at (212, 640)?
-2. **Targeting**: which of the nodes there wants this kind of event?
-3. **Dispatch**: call the listener from chapter 5 with the right event value.
+## A touch sample is not a tap
 
-### Hit testing in paint order
+`TouchGesture` in `crates/app/src/gesture.rs` contains an `Option<ActiveTouch>`. `None` means no active finger; `Some` holds the origin, current position, press time, and flags for dragging and long pressing. The first sample produces `PointerDown`. Later samples can produce a drag when movement reaches the threshold of 12 pixels on either axis. Release produces `PointerUp`, including after a long press. Deciding whether release should activate anything belongs to the routing layer.
 
-```rust
+Time is supplied as milliseconds, rather than read from a clock inside the state machine. This exact method recognizes a stationary hold:
+
+```rust,ignore
+pub fn tick(&mut self, now_ms: u64) -> Option<AppInputEvent> {
+    let active = self.active.as_mut()?;
+
+    if active.dragging
+        || active.long_pressed
+        || now_ms.saturating_sub(active.pressed_at_ms) < LONG_PRESS_MS
+    {
+        return None;
+    }
+
+    active.long_pressed = true;
+
+    Some(AppInputEvent::PointerLongPress(active.position))
+}
+```
+
+`as_mut()` borrows the state inside the option without taking it out. The `?` operator works with `Option` here: no active touch returns `None` immediately. `LONG_PRESS_MS` is 500. After emitting once, the flag suppresses further long presses from that touch. Small movement below the drag threshold can update the reported position without turning the gesture into a drag; “held still” means within the policy's tolerance, not mathematically motionless.
+
+Injecting time makes the boundary cases inspectable without waiting half a second or scheduling real input. A platform must still call `tick` while a finger is down. Merely storing a timestamp does not create a timer.
+
+The resulting `AppInputEvent` vocabulary includes pointer events and higher-level inputs such as `Previous`, `Next`, and `Home`. The application decides their meaning in its current screen. Gesture thresholds are app policy rather than universal truths about UI components; another product could reasonably want different values or gesture rules.
+
+## Find the thing that can respond
+
+A coordinate is not yet a target. The drawer may cover a book page, some nodes are decorative, and a control might listen for activation but not long presses. Hit testing therefore uses both visual geometry and the requested event type.
+
+This exact function in `crates/ui/src/interaction/input/mod.rs` walks the frame's visual nodes:
+
+```rust,ignore
 pub(crate) fn hit_test_event(
     &self,
     root: NodeId,
@@ -42,44 +65,13 @@ pub(crate) fn hit_test_event(
 }
 ```
 
-The function walks the nodes **in paint order** (`visual_nodes` yields them the
-way chapter 8's painter visits them, with clipping and scroll offsets applied)
-and remembers the *last* matching node. The last node painted is the one on top,
-so that's the one the user sees and touches. It's a simple rule, and it
-automatically handles overlays like the control centre or the reader's drawer:
-they're mounted later, so they win.
+The visual iterator includes clipping and scrolling. It follows paint order, so retaining the last eligible match selects the topmost matching node. That qualification matters: a decorative overlay with no listener for this event is not automatically an input barrier. Application routing and appropriate bindings must express modal behavior. “Last painted wins” alone would overstate what the function does.
 
-`visual_nodes(root)` returns an **iterator**. The traversal state (the bounded
-stack from chapter 8) lives inside the iterator struct, and `for` drives it. By
-implementing `Iterator` for a traversal, every consumer can use `for`, `filter`,
-`find`, `any` and friends, instead of writing its own tree walk.
+`TypeId` distinguishes event types. The application defines `LongPressEvent`; the generic UI framework need not add it to a central enum. The lookup asks whether the node has a callback of that particular type, using `.next().is_some()` to test for at least one matching listener.
 
-`event_callbacks(node, event_type).next().is_some()` asks "does this node have
-at least one listener for this event type?". `.next().is_some()` on an iterator is
-the idiomatic and lazy "is it non-empty?".
+The runtime then constructs the event after it knows the target. This exact method is in `crates/ui/src/runtime/mod.rs`:
 
-### Events are types
-
-The `event_type: TypeId` parameter is the key idea of the 13 August commits:
-**events are distinguished by their Rust type**. `ActivateEvent` is one type. The
-app defines its own, like `LongPressEvent`:
-
-```rust
-/// A touch held still on an element. Like `ActivateEvent`, it carries the
-/// element's id, so one listener can serve many elements. Elements take it
-/// with `on:LongPressEvent`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LongPressEvent {
-    id: ElementId,
-    position: Point,
-}
-```
-
-The framework has never heard of `LongPressEvent`, and doesn't need to. An element
-binds a `Listener<LongPressEvent>` with `.on(listener)`. The binding stores
-`TypeId::of::<LongPressEvent>()`, and dispatch finds it again:
-
-```rust
+```rust,ignore
 pub fn dispatch_at_with<E>(
     &self,
     position: Point,
@@ -96,330 +88,41 @@ where
 }
 ```
 
-The caller *names the event type* through the generic parameter, and that type
-selects both which nodes count as hits and which listeners are called. One generic
-function covers every event type the app will ever invent. That's the payoff of
-`TypeId` plus generics: an **open set of event types** without a central enum
-listing them all.
+The closure receives the element's local ID and builds an `E`. `FnOnce` allows that factory to consume captured values because it need only run once. `E: 'static` rules out event types containing short-lived borrowed references; it does not mean every event value must live forever. The result separates “nothing handled this” from an invocation error.
 
-`event: impl FnOnce(ElementId) -> E` builds the event *after* the target is
-found, so the event can carry the target's id (chapter 5's "one listener, many
-buttons"). Taking a closure instead of a value is a nice way to say "I'll give
-you information you don't have yet".
+## Keep the press and release together
 
-The returned `bool` says whether anything handled the event. The app's input code
-(`crates/app/src/input.rs`) uses it for long presses. If an element took the long
-press, the rest of that touch is *captured* and can no longer end as a tap:
+Ordinary activation has a lifecycle rather than being a direct dispatch on every release. `begin_activation_at` records the resolved element identity and applies pressed styling. `complete_activation_at` compares the release target's identity with the remembered one, clears pressed state, and activates only if they match. `cancel_activation` clears the pending press without running activation.
 
-```rust
-let captured = match action {
-    LongPressAction::Ignore => false,
-    LongPressAction::Dispatch => {
-        runtime.dispatch_at_with(position, |id| LongPressEvent { id, position })?
-    }
-    LongPressAction::Capture => true,
-};
-```
+The comparison uses persistent element state identity, not the current arena index from chapter 6. A node can move during rebuilding without becoming a different control. Conversely, releasing on another eligible control must not transfer the original press to it.
 
-## Press, release, cancel
+Pressed styling produces invalidation through the same machinery as other visual changes. A color-only style can need painting; a style affecting layout can require more. The runtime does not assume every visual response is merely a color swap.
 
-A tap isn't a single event. The finger goes down on a button (it should look
-pressed), may slide off (it should look unpressed, and nothing should happen),
-and lifts. The runtime models this as an **activation lifecycle**:
+`dispatch_input` in `crates/app/src/input.rs` adds the gesture policy around that lifecycle. A drag cancels activation before the app handles movement. A long press first asks the app whether to ignore, dispatch, or capture it. If a listener handles the long press, or the app captures it itself, activation is canceled and the remainder of the touch is captured. An unhandled long press need not consume an otherwise valid tap.
 
-```rust
-pub fn begin_activation_at(&mut self, position: Point) -> bool {
-    let target = self.activation_target_at(position);
-    let next = target.map(EventTarget::element);
-    let invalidation = self.set_pressed(next);
+This is why gesture recognition and activation should not be collapsed into one boolean named `clicked`. They answer different questions: what did the finger do, and is the pending activation still permitted?
 
-    self.invalidate_render(invalidation);
+## Let a view say what happened
 
-    target.is_some()
-}
+The close button's listener belongs to `ReaderDrawer`, but closing the drawer changes state owned by the app. The view communicates that intention with a typed emitted event. These are two exact, separate fragments from `crates/app/src/components/reader_menu.rs`, shown together; the method sits inside the drawer's implementation:
 
-pub fn complete_activation_at(&mut self, position: Point) -> Result<bool, ListenerInvokeError> {
-    let Some(pressed) = self.activation.pressed() else {
-        return Ok(false);
-    };
-
-    let target = self.activation_target_at(position);
-    let activated = target.map(EventTarget::element) == Some(pressed);
-
-    // ... clear the pressed state, update focus ...
-
-    let Some(target) = target.filter(|target| target.element() == pressed) else {
-        return Ok(false);
-    };
-
-    self.activate(target)
-}
-
-pub fn cancel_activation(&mut self) { /* ... */ }
-```
-
-The activation completes only if the finger is released over the **same
-element** it pressed: `target.filter(|t| t.element() == pressed)`. `Option::filter`
-keeps the value only if the predicate holds. `target.map(EventTarget::element)`
-passes a *method path* as the mapping function, which is shorter than
-`|t| t.element()`.
-
-`set_pressed` computes what changed and returns an invalidation (chapter 9).
-Pressing a button usually changes only its colour, so it's a `Paint`
-invalidation with damage limited to that button. The framework's `when_pressed`
-styles make that automatic.
-
-## Gestures are app policy
-
-Who decides that a finger held still for 500 ms is a long press? Not the UI
-framework. Commit `8f4372f`, "move interaction policy into app", moved those
-decisions into `inkpaper-app`. The app turns raw touch samples into gestures with
-a small **state machine**:
-
-```rust
-/// Movement past this, in either direction, turns a touch into a drag.
-const DRAG_THRESHOLD_PX: i32 = 12;
-
-/// How long a touch must stay still to become a long press.
-pub const LONG_PRESS_MS: u64 = 500;
-
-#[derive(Debug, Default)]
-pub struct TouchGesture {
-    active: Option<ActiveTouch>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ActiveTouch {
-    origin: Point,
-    position: Point,
-    pressed_at_ms: u64,
-    dragging: bool,
-    long_pressed: bool,
-}
-
-impl TouchGesture {
-    /// The finger has been held still long enough, once per touch.
-    pub fn tick(&mut self, now_ms: u64) -> Option<AppInputEvent> {
-        let active = self.active.as_mut()?;
-
-        if active.dragging
-            || active.long_pressed
-            || now_ms.saturating_sub(active.pressed_at_ms) < LONG_PRESS_MS
-        {
-            return None;
-        }
-
-        active.long_pressed = true;
-
-        Some(AppInputEvent::PointerLongPress(active.position))
-    }
-}
-```
-
-`Option<ActiveTouch>` *is* the state machine's top level. `None` means no finger,
-and `Some` means a finger is down, with the details in the struct. You can't
-read a touch position when no finger is down, because there is no field to read.
-That's "make illegal states unrepresentable", the most useful slogan in Rust
-design.
-
-`self.active.as_mut()?` converts `&mut Option<ActiveTouch>` to
-`Option<&mut ActiveTouch>`, and the `?` operator works on `Option` too: if there
-is no active touch, `tick` returns `None` immediately.
-
-The struct takes the time as a *parameter* (`now_ms`) instead of reading a clock.
-The firmware passes milliseconds from its timer, the simulator passes
-`Instant::now()` converted to milliseconds, and tests pass whatever numbers they
-like. **Injecting time** makes time-dependent logic deterministic to test.
-
-The gestures come out as one platform-independent enum:
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppInputEvent {
-    Previous,
-    Next,
-    Home,
-    PointerDown(Point),
-    PointerDrag { origin: Point, position: Point },
-    /// The pointer stayed down without moving; see [`crate::TouchGesture`].
-    PointerLongPress(Point),
-    PointerUp(Point),
-    PointerCancel,
-}
-```
-
-The firmware maps its side buttons to `Previous`/`Next`, and the simulator maps
-the arrow keys to the same variants. From there on, the app can't tell them apart.
-
-### Deleting a feature
-
-On 26 September, two commits removed features: `c144865` "remove focus
-highlights" and `75dc5fe` "remove focus navigation" (117 lines deleted). Focus
-navigation, moving a highlight between buttons with the side buttons, had been
-in the framework since day three. But the X4 PRO has a touch screen, and on a
-reader the side buttons should turn pages. The framework kept its focus support
-(`focus_next` and friends still exist for other devices), and the app stopped
-using it. Removing code that doesn't serve the product is as much a part of
-building software as writing it.
-
-## Events between entities
-
-By November the app had grown a pattern that hurt. Views like the reader drawer
-were separate entities (for partial rebuilds, chapter 9), but most of their
-taps had to change state that belonged to the app: close the drawer, open a
-screen, change a setting. Until then, each listener in the drawer reached back
-with `self.app.update(cx, ...)` and changed app internals directly. The drawer
-knew far too much about the app.
-
-Commit `93f403e`, "add typed events that entities emit and their owners subscribe
-to", introduced a GPUI-style **emit/subscribe** mechanism. A view declares which
-events it can emit with a **marker trait implementation**:
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DrawerEvent {
-    Close,
-    OpenTextSettings,
-    ToggleTextSetting(TextSetting),
-    ChooseTextOption(TextSetting, usize),
-    SelectChapter,
-    /// entry `0` of Links and footnotes was chosen
-    FollowLink(usize),
-}
-
+```rust,ignore
 impl EventEmitter<DrawerEvent> for ReaderDrawer {}
-```
 
-It emits them from its own listeners, without knowing who listens:
-
-```rust
 fn activate_close(&mut self, _: &ActivateEvent, cx: &mut Context<'_, Self>) {
     cx.emit(DrawerEvent::Close);
 }
 ```
 
-And the owner subscribes once, when it creates the view:
+`EventEmitter` is a marker trait: the empty implementation declares that this entity type may emit `DrawerEvent`. Bounds on `emit` and `subscribe` check that relationship. The owner creates the drawer and subscribes with `cx.subscribe(reader_menu, Self::on_reader_drawer_event)` in `crates/app/src/app/mod.rs`. Its handler in `app/reader.rs` interprets `Close`, text-setting choices, chapter selection, and link selection.
 
-```rust
-let reader_menu = cx.new(|_| ReaderDrawer::new(app));
-cx.subscribe(reader_menu, Self::on_reader_drawer_event);
-```
+This does not make the drawer entirely independent of the app. The current drawer still holds an app entity and reads settings and links from it. The event boundary specifically separates reporting a choice from directly performing every owner mutation. It gives the owner one place to decide what that choice means.
 
-with a handler that decides what the event *means*:
+Emitted entity events are also different from coordinate-targeted input. They need no hit test; they identify their emitter and reach subscribers. Events are small `Copy` values stored in a queue, with compile-time size and alignment checks: at most 16 bytes and alignment at most eight. Larger information should be referenced by an ID or index, rather than embedded in the payload. Queue capacity remains finite; `try_emit` returns an error when emission fails, while `emit` panics on that error.
 
-```rust
-pub(super) fn on_reader_drawer_event(
-    &mut self,
-    _: Entity<ReaderDrawer>,
-    event: &DrawerEvent,
-    cx: &mut Context<'_, Self>,
-) {
-    let changed = match *event {
-        DrawerEvent::Close => return self.close_reader_menu(cx),
-        DrawerEvent::OpenTextSettings => {
-            self.reader.close_menu();
-            self.open_screen(Screen::TextSettings, cx);
-            return;
-        }
-        DrawerEvent::SelectChapter => return self.show_table_of_contents(cx),
-        DrawerEvent::ToggleTextSetting(setting) => self.reader.toggle_text_setting(setting),
-        // the page under the drawer repaginates, so it previews the choice
-        DrawerEvent::ChooseTextOption(setting, index) => {
-            self.reader.choose_text_option(setting, index)
-        }
-        DrawerEvent::FollowLink(index) => self.reader.follow_page_link(index),
-    };
+Delivery is deferred until the surrounding runtime call finishes. This exact helper from `crates/ui/src/runtime/mod.rs` shows the boundary:
 
-    if changed {
-        cx.notify();
-    }
-}
-```
-
-`match *event` matches on the event value. Because `DrawerEvent` is `Copy`,
-dereferencing is free and the arms can bind fields by value. Some arms `return`
-early. Since `return` has type `!` (never), it fits in any arm, whatever type the
-other arms produce. The match as a whole produces a `bool` ("did reader settings
-change?") from the remaining arms.
-
-### Compile-time checks at the boundary
-
-The trait bounds make misuse impossible:
-
-```rust
-pub fn emit<E>(&mut self, event: E)
-where
-    T: EventEmitter<E>,
-    E: Copy + 'static,
-
-pub fn subscribe<U, E>(&mut self, emitter: Entity<U>, handler: Handler<T, U, E>)
-where
-    U: EventEmitter<E>,
-    E: 'static,
-```
-
-A `ReaderDrawer` can't emit a `SettingsEvent`, because there is no `impl
-EventEmitter<SettingsEvent> for ReaderDrawer`. You can't subscribe to an event
-the emitter doesn't declare either. The marker trait has no methods at all. Its
-whole job is to be a *compile-time fact* that bounds can check.
-
-The handler type is a plain function pointer, not a closure:
-
-```rust
-/// a subscriber's handler: its state, the emitter and the event
-pub(crate) type Handler<T, U, E> = fn(&mut T, Entity<U>, &E, &mut Context<'_, T>);
-```
-
-Subscriptions live as long as the runtime, so storing a function pointer avoids
-any arena bookkeeping. Methods like `Self::on_reader_drawer_event` coerce to it
-directly.
-
-### Small events, checked at compile time
-
-Pending events are copied into a fixed queue, each into a 16-byte payload.
-`emit` checks the size *at compile time*:
-
-```rust
-pub(crate) fn emit<E>(
-    events: &dyn EventStore,
-    emitter: EntityId,
-    event: E,
-) -> Result<(), EventError>
-where
-    E: Copy + 'static,
-{
-    const {
-        assert!(
-            mem::size_of::<E>() <= EVENT_BYTES,
-            "an event is at most 16 bytes; send an index or an id instead of larger data"
-        );
-        assert!(mem::align_of::<E>() <= EVENT_ALIGN);
-    }
-
-    let mut payload = EventPayload([MaybeUninit::uninit(); EVENT_BYTES]);
-    // SAFETY: the payload is large and aligned enough for `E`, checked above
-    unsafe { payload.0.as_mut_ptr().cast::<E>().write(event) };
-    // ...
-}
-```
-
-`const { ... }` is an **inline const block** (stable since Rust 1.79). It is
-evaluated at compile time *for each `E` the function is instantiated with*. If
-someone emits a 40-byte event, the build fails with that friendly message,
-pointing at the problem before the code ever runs. Chapter 9 achieved the same
-with an associated constant. Inline `const` is the newer, more direct form.
-
-`E: Copy` matters for safety, too. A `Copy` type has no destructor, so bytes in
-the queue can be duplicated or forgotten without leaking anything.
-
-### Delivered after the call
-
-Events don't run handlers immediately. They wait in a queue "until the runtime
-call that emitted them returns", in the words of the module documentation:
-
-```rust
-/// runs `call`, which runs user code, then delivers the events it emitted unless
-/// an outer runtime call still runs, which delivers them when it returns
+```rust,ignore
 fn deliver_events_after<R>(&self, call: impl FnOnce() -> R) -> R {
     let depth = CallDepth::enter(&self.call_depth);
     let result = call();
@@ -433,34 +136,10 @@ fn deliver_events_after<R>(&self, call: impl FnOnce() -> R) -> R {
 }
 ```
 
-Why wait? When the drawer emits `Close` from inside its own listener, the drawer
-is **exclusively borrowed** (the trampoline from chapter 5 holds the borrow).
-If the app's handler ran right away and tried to reset the drawer, it would hit a
-`BorrowConflict`. Delivering after the outermost call returns guarantees every
-borrow has been released. `CallDepth` is a drop guard (chapter 3) that decrements
-a counter, so nested runtime calls only deliver once, at the outermost level.
+While a drawer listener runs, its entity state is mutably borrowed. Immediately calling an owner handler that updates the drawer could collide with that borrow. Waiting for the outer call to return gives that listener's borrow a chance to end. The depth guard handles nested runtime calls. This is controlled synchronous delivery after a boundary, not an asynchronous task or a general cure for every possible borrowing conflict.
 
-## Rust concepts in this chapter
+## Try it: hold, then release
 
-- **Iterators** for tree traversal; `.next().is_some()`.
-- **`TypeId` + generics** for an open set of event types.
-- **Closures that receive information later** (`impl FnOnce(ElementId) -> E`).
-- **`Option` combinators** `filter`, `map` with method paths, `as_mut`, and `?` on
-  `Option`.
-- **State machines with `Option`**; "make illegal states unrepresentable".
-- **Injecting time** for testable logic.
-- **Marker traits** as compile-time facts (`EventEmitter<E>`).
-- **Function pointer types** with `type` aliases.
-- **`match *value`** on `Copy` enums; `return` in match arms and the never type.
-- **Inline `const { assert!(...) }`** blocks.
-- **Deferred execution** to avoid re-entrant borrows.
+For an optional hardware-free experiment, read `a_still_touch_long_presses_once_after_the_delay` in `crates/app/src/gesture.rs`. Trace a touch starting at 1,000 ms: the tick at 1,499 returns `None`, the tick at 1,500 produces `PointerLongPress`, and a later tick returns `None` again. Release still produces `PointerUp`.
 
-## Try it yourself
-
-1. Read `crates/ui/src/runtime/event_tests.rs`. Add a test where an emitter
-   emits two events from one listener, and check the order in which the
-   subscriber receives them.
-2. Add a `[u8; 32]` field to `DrawerEvent::FollowLink` and build. Read the error.
-3. Write a unit test for `TouchGesture`: touch at t=0, tick at t=499 (expect
-   `None`), tick at t=500 (expect a long press), tick at t=900 (expect `None`
-   again).
+Now follow that release through `dispatch_input` after a handled long press. The routing layer has canceled activation and captured the touch, so the later release must not run the ordinary tap action. The observable outcome is the sequence of returned variants and selected branches. It demonstrates why raw samples, recognized gestures, activation listeners, and emitted intentions are four useful boundaries rather than four names for the same event.

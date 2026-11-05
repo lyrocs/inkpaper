@@ -1,293 +1,117 @@
-# 5. Listeners: storing closures without `Box`
+# 5. Giving a tap meaning: listeners and closures
 
-> **Where we are:** commits `f309c6d` ("add fixed capacity typed listener arena")
-> and `b592d3e` ("add typed click interactions"), 8 August 2026, then
-> `e655da0` ("add entity-bound canvas callbacks", 13 August), `02973df` ("pass
-> the activated element id to activate listeners", 27 September) and `0bf3c30`
-> ("release callbacks by owning entity", 4 October).
+The reader's settings drawer has a Text tab and a More tab. A tap on More should change the selected tab, leave the book alone, and arrange for the drawer to show its new contents. The button needs behavior that survives longer than the render call that created it—but it must not hold the entire application mutably borrowed while waiting for a finger.
 
-## The problem: behaviour, not just data
+This is where the previous two chapters meet. An entity gives state a durable home. A slot table can store a value whose concrete type the container does not know. A Rust closure is just such a value. InkPaper stores the behavior separately and borrows the target state only when an event actually arrives.
 
-A button has to *do* something when you tap it. In most Rust GUI code, that
-something is a closure stored as `Box<dyn Fn(...)>`. A `Box` needs a heap, and our
-fixed-storage runtime doesn't have one.
+## The state is an argument, not a capture
 
-There is a second, subtler problem. A closure that changes the app's state needs
-access to that state. If the closure captured `&mut app`, it would hold a
-mutable borrow for as long as the closure exists, which is forever, and nothing
-else could touch the app. Capturing an `Rc<RefCell<App>>` brings us back to the
-heap and to runtime borrow panics.
+The drawer's handlers live in `crates/app/src/components/reader_menu.rs`. These two exact methods are shown together, with intervening methods omitted:
 
-InkPaper answers both problems with one idea, again inherited from GPUI: **a
-listener is a closure stored in an arena and bound to an entity**. When an event
-arrives, the runtime borrows the entity and *passes* `&mut state` to the closure as
-an argument. The closure itself captures nothing but cheap, `Copy` data.
-
-## What it looks like to the user
-
-Here is how the reader's drawer wires its buttons, in
-`crates/app/src/components/reader_menu.rs` (shortened):
-
-```rust
-impl ReaderDrawer {
-    fn activate_text_tab(&mut self, _: &ActivateEvent, cx: &mut Context<'_, Self>) {
-        self.select_tab(ReaderMenuTab::Text, cx);
-    }
-
-    fn activate_close(&mut self, _: &ActivateEvent, cx: &mut Context<'_, Self>) {
-        cx.emit(DrawerEvent::Close);
+```rust,ignore
+fn select_tab(&mut self, tab: ReaderMenuTab, cx: &mut Context<'_, Self>) {
+    if self.tab != tab {
+        self.tab = tab;
+        cx.notify();
     }
 }
 
-impl Render for ReaderDrawer {
-    fn render<'a>(&'a mut self, cx: &mut Context<'_, Self>) -> impl IntoElement + 'a {
-        // ...
-        let menu = ReaderMenu::from(ReaderMenuProps {
-            tab: self.tab,
-            on_close: cx.listener(Self::activate_close),
-            on_text_tab: cx.listener(Self::activate_text_tab),
-            // ...
-        });
-        // ...
-    }
+fn activate_more_tab(&mut self, _: &ActivateEvent, cx: &mut Context<'_, Self>) {
+    self.select_tab(ReaderMenuTab::More, cx);
 }
 ```
 
-Inside `ReaderMenu`, an element attaches the listener. The menu is written with
-the `rsx!` macro from chapter 19, where `on:activate={...}` is shorthand for the
-builder call `.on_activate(listener)`:
+The handler changes `self` and notifies only when the selected tab differs. During rendering, the drawer registers it with `cx.listener(Self::activate_more_tab)` and passes the resulting handle through `ReaderMenuProps`. A menu tab attaches that handle using `on:activate`, the macro spelling of the fluent `.on_activate(...)` API. Chapter 19 covers the macro; the behavior does not depend on knowing its syntax today.
 
-```rust
-on:activate={self.on_close}
-```
+`Self::activate_more_tab` is a method used as a function value. The state is its first argument, rather than something captured from the render call. That is why no long-lived `&mut ReaderDrawer` needs to sit inside the button. The framework supplies a fresh exclusive borrow when it invokes the listener.
 
-There are two things to notice.
+The exact public convenience method in `crates/ui/src/context.rs` explains the contract:
 
-1. `Self::activate_close` is a plain **method** passed where a closure is
-   expected. Methods are functions whose first parameter is `self`, so
-   `ReaderDrawer::activate_close` has the type
-   `fn(&mut ReaderDrawer, &ActivateEvent, &mut Context<'_, ReaderDrawer>)`.
-2. `cx.listener(...)` returns a `Listener<ActivateEvent>`, a small `Copy`
-   value that can be passed down through components like any other prop.
-
-## The signature
-
-```rust
-impl<T: 'static> Context<'_, T> {
-    pub fn listener<E, F>(&mut self, callback: F) -> Listener<E>
-    where
-        E: 'static,
-        F: Fn(&mut T, &E, &mut Context<'_, T>) + 'static,
-    {
-        self.try_listener(callback)
-            .unwrap_or_else(|error| panic!("could not allocate listener: {error:?}"))
-    }
-}
-```
-
-Let's read the bound `F: Fn(&mut T, &E, &mut Context<'_, T>) + 'static`.
-
-### `Fn`, `FnMut` or `FnOnce`?
-
-Rust has three closure traits, and each describes how the closure uses what it
-captured:
-
-| Trait | Can be called | May mutate captures | May move captures out |
-|-------|---------------|---------------------|-----------------------|
-| `FnOnce` | once | yes | yes |
-| `FnMut` | many times, needs `&mut` | yes | no |
-| `Fn` | many times, `&` is enough | no | no |
-
-Every `Fn` is also `FnMut` and `FnOnce`. A listener may run many times, so it
-can't be `FnOnce`. And InkPaper wants **all mutable state in entities**, not
-hidden in closure captures, so it requires `Fn`. When a handler needs to change
-something, it changes `&mut T`, the entity state it receives as an argument. That
-state is visible to the rest of the app, and the runtime can track changes to it.
-Captured state would be invisible to both.
-
-### Lifetimes you didn't write
-
-The parameter types contain references with no named lifetime: `&mut T`, `&E`,
-`&mut Context<'_, T>`. In a closure *trait bound*, elided lifetimes become
-**higher-ranked**. The bound really means
-
-```rust
-F: for<'x, 'y, 'z, 'w> Fn(&'x mut T, &'y E, &'z mut Context<'w, T>)
-```
-
-"for *every* choice of lifetimes, `F` can be called". The closure must accept
-borrows of any duration, so the runtime can pass short-lived borrows each time
-it calls it. You rarely write `for<...>` yourself, but it's good to know that
-this is what makes the API work.
-
-### Why `'static`?
-
-The closure is stored in the runtime and called later, after the current function
-has returned. If it captured a reference to a local variable, that reference
-would dangle. `F: 'static` means "`F` contains no borrowed data that could expire".
-Closures that capture nothing, or capture only owned `Copy` values like an
-`Entity<T>` handle or an index, satisfy it automatically. This is another reason
-handles are so convenient: a `'static` closure can capture an `Entity<App>` and
-reach the app through it later, and the compiler won't complain.
-
-## Storing a closure in raw bytes
-
-Every closure in Rust has its **own anonymous type**, even two textually
-identical ones. That type is just a struct of its captures, and its size is known
-to the compiler. A closure that captures nothing, like `Self::activate_close`, is
-**zero-sized**.
-
-So the trick from chapter 4 applies directly. Reserve a slot with the closure's
-`Layout`, write the closure's bytes into it, and keep a monomorphised function
-that knows how to call it:
-
-```rust
-pub(crate) fn register_listener<T, E, F>(
-    store: &dyn CallbackStore,
-    owner: EntityId,
-    entity: Entity<T>,
-    callback: F,
-) -> Result<Listener<E>, CallbackAllocError>
+```rust,ignore
+pub fn listener<E, F>(&mut self, callback: F) -> Listener<E>
 where
-    T: 'static,
     E: 'static,
     F: Fn(&mut T, &E, &mut Context<'_, T>) + 'static,
 {
-    let reservation = store.reserve(
-        Layout::new::<F>(),
-        owner,
-        entity.entity_id(),
-        CallbackKind::Listener {
-            event_type: TypeId::of::<E>(),
-            invoke_fn: invoke_listener_callback::<T, E, F>,
-        },
-        drop_callback::<F>,
-    )?;
-
-    unsafe { reservation.ptr.cast::<F>().as_ptr().write(callback) };
-    unsafe { store.commit(reservation.id) };
-
-    Ok(Listener::from_id(reservation.id))
+    self.try_listener(callback)
+        .unwrap_or_else(|error| panic!("could not allocate listener: {error:?}"))
 }
 ```
 
-The metadata stores:
+Here `T` is the context's entity type, `E` is the event type, and `F` is the concrete callable type. The returned `Listener<E>` is a copyable handle, not the closure itself. Its event type makes it difficult to attach unrelated behavior to the wrong sort of event. Its runtime ID locates the stored callback.
 
-- the **event type**, as a `TypeId`, so that a `Listener<ActivateEvent>` can
-  never be called with some other event;
-- **`invoke_fn`**, a *trampoline* function pointer;
-- the **target entity**, whose state the closure will receive;
-- the **owner**, whose next render will free the closure (more below).
+The convenient method panics on allocation failure. `try_listener` exposes that failure as a `Result`, including fixed slot exhaustion, byte exhaustion, and unsupported alignment. A callback that captures no data still needs a slot; chapter 4's fixed storage also gives zero-sized values distinct places. “No captures” does not mean “unlimited listeners.”
 
-### The trampoline
+## What a closure promises about tomorrow
 
-`invoke_listener_callback::<T, E, F>` is generic over all three types, but once
-instantiated it is a plain function with an erased signature:
+Rust distinguishes callable values by what invocation needs. `FnOnce` permits consuming captured values and therefore guarantees only one call. `FnMut` supports repeated calls with mutable access to the closure. `Fn` supports calls through a shared reference. A callable implementing `Fn` also meets the weaker `FnMut` and `FnOnce` requirements.
 
-```rust
-unsafe fn invoke_listener_callback<T, E, F>(
-    closure: *const u8,
-    target: EntityId,
-    event: *const u8,
-    runtime: RuntimeCx<'_>,
-) -> Result<(), ListenerInvokeError>
-where
-    T: 'static,
-    E: 'static,
-    F: Fn(&mut T, &E, &mut Context<'_, T>) + 'static,
-{
-    let borrow = RawEntityBorrow::acquire(
-        runtime.entities,
-        target,
-        TypeId::of::<T>(),
-        BorrowKind::Exclusive,
-    )?;
+InkPaper requires `Fn`. This keeps ordinary mutation in the explicit `&mut T` argument instead of requiring exclusive access to the callback object. It is not an absolute ban on mutable captures: a closure could hold a `Cell` or another interior-mutability type and still implement `Fn`. The useful design discipline is to put application state in entities, where access and notifications have a visible home, rather than hiding it in handler captures.
 
-    let state = unsafe { &mut *borrow.ptr().cast::<T>().as_ptr() };
-    let event = unsafe { &*event.cast::<E>() };
-    let callback = unsafe { &*closure.cast::<F>() };
-    let entity = Entity::<T>::from_id(target);
-    let mut cx = Context::new_in(entity, runtime);
+The `'static` requirement solves a different problem. The callback may run after the current render returns, so it cannot borrow a local string or the temporary `&mut self`. Owning a number, an entity handle, or even a `String` can satisfy `'static`; it means no contained borrow requires a shorter lifetime. An owned string would carry allocation costs, and a `move` closure that captures a borrowed reference still contains that reference. `move` changes capture mode, not the referent's lifetime.
 
-    callback(state, event, &mut cx);
+Meanwhile, the references *passed into* the callback are temporary. The `Fn` bound accepts fresh short-lived references on each invocation; the callback is not entitled to retain them. This is the intuition behind higher-ranked lifetimes: the stored callable must work for the borrow durations selected when it is called, not demand that an event or state reference live as long as the callback.
 
-    Ok(())
-}
+These two directions are easy to confuse. The callback's captures must remain valid while stored. Its arguments need remain valid only for the call. Passing state as an argument lets the framework meet both requirements without a reference-counted pointer in every button.
+
+## Store the callable, remember how to call it
+
+Each closure expression has its own anonymous concrete type. That type contains its captures, and the compiler knows its size and alignment. A function item such as `Self::activate_more_tab` is zero-sized; it can later be coerced to a function pointer, which is a different representation. InkPaper's generic registration does not need to box a trait object merely to retain the callable.
+
+This exact body excerpt from `register_listener` in `crates/ui/src/callback/arena.rs` shows how chapter 4's storage is used:
+
+```rust,ignore
+let reservation = store.reserve(
+    Layout::new::<F>(),
+    owner,
+    entity.entity_id(),
+    CallbackKind::Listener {
+        event_type: TypeId::of::<E>(),
+        invoke_fn: invoke_listener_callback::<T, E, F>,
+    },
+    drop_callback::<F>,
+)?;
+
+unsafe { reservation.ptr.cast::<F>().as_ptr().write(callback) };
+unsafe { store.commit(reservation.id) };
+
+Ok(Listener::from_id(reservation.id))
 ```
 
-It is the bridge between the untyped world of the arena (`*const u8`) and the
-typed world of user code. Inside, it knows `T`, `E` and `F` again, so it can:
+The slot stores the callable value, its destructor, the target entity, its owner, and enough metadata to invoke it correctly. The specialized `invoke_listener_callback::<T, E, F>` is a *trampoline*: a function that bridges an erased representation back to concrete types.
 
-1. take an **exclusive** borrow of the target entity, which fails with
-   `BorrowConflict` instead of creating two `&mut`;
-2. cast the three pointers back to their real types;
-3. build a fresh `Context` for the target;
-4. call the closure.
+Before entering it, the caller validates a live callback ID, checks that the callback kind is a listener, and compares the event's `TypeId`. The trampoline then performs this exact body from the same file:
 
-The caller side checks the event type before using the trampoline:
+```rust,ignore
+let borrow = RawEntityBorrow::acquire(
+    runtime.entities,
+    target,
+    TypeId::of::<T>(),
+    BorrowKind::Exclusive,
+)?;
 
-```rust
-let CallbackKind::Listener {
-    event_type,
-    invoke_fn,
-} = meta.kind
-else {
-    return Err(ListenerInvokeError::InvalidListener);
-};
+let state = unsafe { &mut *borrow.ptr().cast::<T>().as_ptr() };
+let event = unsafe { &*event.cast::<E>() };
+let callback = unsafe { &*closure.cast::<F>() };
+let entity = Entity::<T>::from_id(target);
+let mut cx = Context::new_in(entity, runtime);
 
-if event_type != TypeId::of::<E>() {
-    return Err(ListenerInvokeError::EventTypeMismatch);
-}
+callback(state, event, &mut cx);
+
+Ok(())
 ```
 
-That is **`let ... else`**, stabilised in Rust 1.65: destructure a value with a
-pattern, and if the pattern doesn't match, run the `else` block, which must
-leave the function with `return`, `break`, `continue` or a panic. It keeps the
-happy path flat instead of nesting it inside `if let`. InkPaper uses it
-everywhere.
+The target borrow is exclusive for the entire call. A conflicting access returns an error before another mutable reference is created. The event and closure casts rely on the registration and dispatch checks agreeing about `E` and `F`. This is a connected safety argument: the raw pointers are not safe because a cast looks plausible, but because the exact types and lifetimes were established elsewhere.
 
-## Typed handles again
+With fixed callback storage, this happens without a general-purpose heap allocation for the closure. With heap callback storage, the same mechanism uses allocated places. The design separates dispatch semantics from the storage policy rather than requiring one choice for every platform.
 
-`Listener<E>` mirrors `Entity<T>`:
+## Behavior belongs to the rendered view
 
-```rust
-pub struct Listener<E> {
-    pub(crate) id: CallbackId,
-    _event: PhantomData<fn(&E)>,
-}
-```
+A new render may register new listeners. Keeping every old one would eventually fill a fixed table, while deleting every callback on every partial update would break unchanged buttons. InkPaper therefore distinguishes who *owns* a callback from whose state it *targets*.
 
-This time the marker is `PhantomData<fn(&E)>`, a function that *takes* an `E`.
-That is the honest description of a listener: it *consumes* events of type `E`.
-The choice also affects **variance**, which controls when a
-`Listener<Something<'long>>` may be used as a `Listener<Something<'short>>`. Our
-events are `'static`, so in practice it doesn't matter here. The point is that
-the marker is chosen to describe the relationship, not picked at random.
+This exact metadata definition in `crates/ui/src/callback/arena.rs` records that distinction:
 
-## When do listeners die?
-
-Listeners are created *during render*, and a render can happen many times. If
-each render added new closures and nothing removed the old ones, the arena would
-fill up within minutes.
-
-A full rebuild still clears every callback before the frame is rendered again. Callback ids carry a generation precisely for that. A `Listener` held
-from an older frame has a stale generation, and the arena rejects it instead of
-calling whatever closure now sits in that slot:
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CallbackId {
-    slot: u16,
-    generation: u32,
-}
-```
-
-When partial rebuilds arrived in October (chapter 9), "clear everything each
-frame" no longer worked: an entity that does *not* render again keeps its
-existing nodes, and those nodes still point at its listeners. So commit `0bf3c30`
-gave each callback an **owner**, the entity whose render registered it:
-
-```rust
+```rust,ignore
 #[derive(Clone, Copy)]
 struct CallbackMeta {
     /// the entity whose render registered the callback, or the target outside rendering.
@@ -300,115 +124,18 @@ struct CallbackMeta {
 }
 ```
 
-When the drawer renders again, only the drawer's callbacks are released. Later,
-commit `5ebdab8` ("reuse the callback slots a partial rebuild releases") made new
-registrations refill those freed slots (`reserve_reusing` in the slot table)
-instead of growing forever.
+The owner is the rendering entity, or the target when registration happens outside rendering. It governs the callback's lifetime. The target governs which state the handler receives. They can differ when one entity constructs behavior targeting another through that target's context.
 
-The owner and the target can differ. A parent component may render a listener
-that targets a child entity. The owner decides *lifetime*, and the target decides
-*whose state* the closure receives.
+A full rebuild resets the callbacks. A partial rebuild takes a callback mark before rendering; after successfully rebuilding and compacting the affected frame, it releases older callbacks belonging to stale owners. Newly registered callbacks survive that release, and callbacks belonging to unaffected views stay callable. The released slots may be reused for later registrations.
 
-## Canvases: callbacks for painting
+A callback ID contains both a slot and a generation. Lookup compares the ID with the live slot's stored generation, rejecting stale handles rather than interpreting them as a newly placed closure. This is a finite generation counter, not an eternal uniqueness guarantee: the implementation advances a `u32` with wrapping arithmetic. Most importantly for callers, copying a `Listener` does not extend its validity. It is a view-bound handle, not a permanent subscription.
 
-The same mechanism stores a second kind of closure: **canvas callbacks**, which
-paint directly instead of producing elements. The reader page is drawn this way,
-because it's one big block of positioned text and laying it out as hundreds of
-`div`s would be wasteful:
+A separate subscription mechanism handles entity-to-entity events. For example, closing the reader drawer emits `DrawerEvent::Close`; subscribers receive it after the current runtime call returns. That delay lets the listener's mutable entity borrow end before subsequent handlers run. Canvas callbacks also use the callback arena, but receive shared `&T` access for painting rather than the listener's `&mut T` access for behavior.
 
-```rust
-cx.canvas(|app: &InkPaperApp, paint| app.paint_reader_page(paint))
-```
+Finally, not every row needs its own closure. `ActivateEvent` carries an element ID, and `index()` extracts its numeric part when representable as `usize`. The drawer's text rows share a listener; `activate_text_row` uses `index().and_then(...)` with `TextSetting::PANEL.get(index)`. Missing or out-of-range indices return early. This trades a small explicit dispatch step for fewer stored callbacks, while keeping row identity separate from closure identity.
 
-Its bound is `F: Fn(&T, &mut PaintCx<'_>) + 'static`, a **shared** `&T` this time,
-because painting must not change state. The callback kind enum distinguishes the
-two:
+## Try it: trace two taps without a screen
 
-```rust
-pub enum CallbackKind {
-    Listener {
-        event_type: TypeId,
-        invoke_fn: ListenerInvokeFn,
-    },
-    Canvas {
-        invoke_fn: CanvasInvokeFn,
-    },
-}
-```
+Optional, read-only: open `ReaderDrawer::activate_more_tab` and `select_tab` in `crates/app/src/components/reader_menu.rs`. Assume the drawer starts on Text. Trace one More activation, then a second More activation.
 
-`try_canvas` also records that the render *read* its target entity, so changing the
-entity repaints the canvas. That's the dependency tracking we meet in chapter 9.
-
-## One listener, many buttons
-
-Early on, `ActivateEvent` carried nothing. That made lists awkward: a list of 30
-chapters needed 30 listeners, all slight variations of the same closure. Commit
-`02973df` put the activated element's id into the event:
-
-```rust
-/// An element was activated. It carries the element's id, so one listener can
-/// serve many elements, such as every row of a list or every key of a keyboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActivateEvent {
-    id: ElementId,
-}
-
-impl ActivateEvent {
-    /// The number in the activated element's id, such as 3 for `("row", 3)`. `None`
-    /// when the number doesn't fit a `usize`
-    pub fn index(self) -> Option<usize> {
-        match self.id {
-            ElementId::Value(value) | ElementId::NamedValue(_, value) => {
-                usize::try_from(value).ok()
-            }
-            ElementId::Name(_) => None,
-        }
-    }
-}
-```
-
-Now a single handler serves every row:
-
-```rust
-fn activate_text_row(&mut self, event: &ActivateEvent, cx: &mut Context<'_, Self>) {
-    let Some(&setting) = event
-        .index()
-        .and_then(|index| TextSetting::PANEL.get(index))
-    else {
-        return;
-    };
-    // ...
-}
-```
-
-`Option::and_then` chains two fallible steps (is there an index? is it in
-range?), `slice::get` returns `None` instead of panicking when out of range, and
-`let ... else` exits if either step fails. Three lines, no panics, no nesting.
-Notice also the `|` in the `match` arm: `ElementId::Value(value) |
-ElementId::NamedValue(_, value)` binds `value` from either variant, which works
-because both bind the same name with the same type.
-
-## Rust concepts in this chapter
-
-- **Closure traits** `Fn`, `FnMut`, `FnOnce`, and why `Fn` fits event handlers.
-- **Methods as function values** (`Self::activate_close`).
-- **Higher-ranked trait bounds** (`for<'a>`), implied by elided lifetimes in
-  `Fn(...)` bounds.
-- **`'static` bounds** on stored closures.
-- **Closure types are unique and sized**, and zero-sized when they capture nothing.
-- **Trampolines**: monomorphised `unsafe fn` pointers that restore erased types.
-- **`let ... else`**, `Option::and_then`, `slice::get`, or-patterns in `match`.
-- **Variance** and choosing `PhantomData<fn(&E)>`.
-- **Generational ids** to reject stale handles.
-
-## Try it yourself
-
-1. Write a closure that captures a `&str` borrowed from a local `String` and pass
-   it to `cx.listener` in a test. Read the error about `'static`. Then capture an
-   owned `u32` instead and watch it compile.
-2. Change the bound in `Context::listener` from `Fn` to `FnMut`. Which line in
-   `invoke_listener_callback` stops compiling, and why? (Hint: what kind of
-   reference to the closure does it create?)
-3. Print `core::mem::size_of_val(&ReaderDrawer::activate_close)` and the size of a
-   closure capturing an `Entity<_>`. Relate the numbers to the `Layout` passed to
-   `reserve`.
+The expected result is one tab assignment and one notification: the second invocation still runs, but the equality check avoids another state change. Then find `on_more_tab: cx.listener(Self::activate_more_tab)` in the same file and follow the prop to `MenuTab`'s `on:activate`. You should be able to identify the stored behavior, the copyable handle, the target state, and the moment that state is borrowed. No hardware, unsafe changes, or new tests are needed to follow the complete path from a button to a visible decision.
