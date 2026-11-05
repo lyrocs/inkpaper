@@ -1,0 +1,9 @@
+[book]
+title = "Building InkPaper: Learning Rust by Building an E-Reader"
+authors = ["InkPaper contributors"]
+language = "en"
+src = "src"
+description = "A step-by-step tour of how InkPaper was built, used to teach Rust with concrete examples from a real no_std firmware and UI stack."
+
+[output.html]
+git-repository-url = "https://github.com/lyrocs/inkpaper"
