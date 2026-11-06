@@ -28,6 +28,10 @@ ui-features:
 book:
     mdbook serve book --open
 
+# renders the book as a landscape .xtch for the X4 (buttons: right | left)
+book-xtch buttons="right" output="target/book/Building InkPaper.xtch":
+    uv run book/xtch/book2xtch.py --buttons {{buttons}} --output "{{output}}"
+
 sim:
     cargo run -p {{simulator_package}}
 

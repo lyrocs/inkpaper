@@ -168,6 +168,12 @@ with small experiments to try in the repository. Read it on GitHub, or build it 
 mdbook serve book --open
 ```
 
+To read it on the X4 itself, `just book-xtch` renders it as a landscape `.xtch` file in
+`target/book/` (it needs [`uv`](https://docs.astral.sh/uv/) and Chrome or Playwright's
+Chromium). Code blocks are never cut across pages: a block that does not fit in the rest of
+a page starts on the next one. Pass `just book-xtch left` if you hold the device with its
+buttons on the left.
+
 ## Contributing
 
 InkPaper is still early and its internal design is changing quickly.
